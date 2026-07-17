@@ -50,6 +50,19 @@ pub struct Bead {
     /// RFC3339 — lexicographic order is arrival order.
     #[serde(default)]
     pub created_at: Option<String>,
+    #[serde(default)]
+    pub labels: Vec<String>,
+}
+
+/// The label a genuine overseer escalation carries. Beads assigned to the
+/// overseer that lack it (mail/reply messages tagged `gt:message`, etc.) are
+/// NOT escalations and must never nag the pet.
+pub const ESCALATION_LABEL: &str = "gt:escalation";
+
+impl Bead {
+    fn is_escalation(&self) -> bool {
+        self.labels.iter().any(|l| l == ESCALATION_LABEL)
+    }
 }
 
 /// Escalation nag policy: only the *latest* open escalation nags. Any open
@@ -62,11 +75,13 @@ pub struct EscalationTracker {
 }
 
 impl EscalationTracker {
-    /// Pick the bead to nag about (if any) and record supersessions.
+    /// Pick the bead to nag about (if any) and record supersessions. Only
+    /// open beads carrying the escalation label are considered — plain
+    /// overseer mail/replies (e.g. `gt:message`) are never escalations.
     pub fn select<'b>(&mut self, beads: &'b [Bead]) -> Option<&'b Bead> {
         let open: Vec<&Bead> = beads
             .iter()
-            .filter(|b| b.status.as_deref() != Some("closed"))
+            .filter(|b| b.status.as_deref() != Some("closed") && b.is_escalation())
             .collect();
         let newest = open.iter().max_by_key(|b| (&b.created_at, &b.id)).copied()?;
         for stale in open.iter().filter(|b| b.id != newest.id) {
@@ -340,6 +355,7 @@ mod tests {
                 title: Some("Confirm Block B state".into()),
                 assignee: Some("overseer".into()),
                 created_at: Some("2026-07-15T00:00:00Z".into()),
+                labels: vec![ESCALATION_LABEL.into()],
             }],
             polecats: vec![],
         }
@@ -384,6 +400,43 @@ mod tests {
     }
 
     #[test]
+    fn only_escalation_labeled_overseer_beads_nag() {
+        let overseer = |id: &str, labels: &[&str]| Bead {
+            id: id.into(),
+            status: Some("open".into()),
+            title: Some(format!("t-{id}")),
+            assignee: Some("overseer".into()),
+            created_at: Some("2026-07-17T00:00:00Z".into()),
+            labels: labels.iter().map(|s| s.to_string()).collect(),
+        };
+        let mut tracker = EscalationTracker::default();
+        // A genuine escalation is selected.
+        assert_eq!(
+            tracker.select(&[overseer("hq-esc", &["gt:escalation"])]).map(|b| b.id.as_str()),
+            Some("hq-esc")
+        );
+        // Plain mail/reply beads assigned to the overseer are NOT escalations.
+        let mut tracker = EscalationTracker::default();
+        assert!(tracker
+            .select(&[
+                overseer("hq-msg", &["gt:message", "msg-type:reply"]),
+                overseer("hq-plain", &[]),
+            ])
+            .is_none());
+        // Mixed: only the escalation-labeled one is eligible.
+        let mut tracker = EscalationTracker::default();
+        assert_eq!(
+            tracker
+                .select(&[
+                    overseer("hq-msg", &["gt:message"]),
+                    overseer("hq-real", &["gt:escalation"]),
+                ])
+                .map(|b| b.id.as_str()),
+            Some("hq-real")
+        );
+    }
+
+    #[test]
     fn only_latest_escalation_nags_and_superseded_stay_ignored() {
         let bead = |id: &str, created: &str| Bead {
             id: id.into(),
@@ -391,6 +444,7 @@ mod tests {
             title: Some(format!("t-{id}")),
             assignee: Some("overseer".into()),
             created_at: Some(created.into()),
+            labels: vec![ESCALATION_LABEL.into()],
         };
         let mut tracker = EscalationTracker::default();
         let mut o = obs();

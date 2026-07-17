@@ -99,7 +99,15 @@ async fn observe(config: &GastownConfig) -> anyhow::Result<TownObservation> {
         }
     }
 
-    match run_cli(config, "bd", &["list", "--json", "--assignee=overseer"]).await {
+    // Narrow at the source to genuine escalations; the pure adapter
+    // (EscalationTracker) enforces the same label filter and is unit-tested.
+    match run_cli(
+        config,
+        "bd",
+        &["list", "--json", "--assignee=overseer", "--label=gt:escalation"],
+    )
+    .await
+    {
         Ok(json) => match parse_lenient_list(&json) {
             Ok(beads) => obs.escalations = beads,
             Err(e) => warn!("escalation list unparseable: {e}"),
