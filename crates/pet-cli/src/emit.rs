@@ -23,6 +23,11 @@ fn try_run(rest: &[&str]) -> anyhow::Result<()> {
             let tail = claude_tail(&json);
             pet_adapters::claude::map_hook(&json, parent_pid(), tail)?
         }
+        // Headless `codex exec` runs (automation, pane-summarizer title jobs)
+        // are non-interactive, unfocusable, and flood the pet with one-shot
+        // sessions — drop them. Interactive codex (the TUI) is kept.
+        ["codex"] if codex_is_headless() => return Ok(()),
+        ["codex-notify", _] if codex_is_headless() => return Ok(()),
         ["codex"] => pet_adapters::codex::map_hook(&read_stdin()?, parent_pid())?,
         ["codex-notify", json] => pet_adapters::codex::map_notify(json)?,
         _ => anyhow::bail!("unknown emit target {rest:?}"),
@@ -134,6 +139,44 @@ fn read_stdin() -> anyhow::Result<String> {
     Ok(buf)
 }
 
+/// True when this codex hook/notify was fired by a headless `codex exec`
+/// (as opposed to the interactive TUI). The emitter's ancestry includes the
+/// codex process; walk up a few levels (past any node/shell shim) and look
+/// for a `codex … exec` invocation.
+fn codex_is_headless() -> bool {
+    let mut pid = parent_pid();
+    for _ in 0..6 {
+        let Some(p) = pid else { break };
+        if let Some(cmdline) = std::fs::read_to_string(format!("/proc/{p}/cmdline")).ok() {
+            let args: Vec<&str> = cmdline.split('\0').filter(|a| !a.is_empty()).collect();
+            if cmdline_is_codex_exec(&args) {
+                return true;
+            }
+        }
+        pid = std::fs::read_to_string(format!("/proc/{p}/stat"))
+            .ok()
+            .and_then(|s| parse_stat_ppid(&s));
+    }
+    false
+}
+
+/// Args form a `codex … exec …` invocation: a `codex`-like binary followed by
+/// the `exec` subcommand (before any non-subcommand flag). Pure.
+fn cmdline_is_codex_exec(args: &[&str]) -> bool {
+    let Some(bin_idx) = args
+        .iter()
+        .position(|a| a.rsplit('/').next().is_some_and(|b| b.starts_with("codex")))
+    else {
+        return false;
+    };
+    args.get(bin_idx + 1..)
+        .unwrap_or_default()
+        .iter()
+        .take_while(|a| !a.starts_with('-'))
+        .take(2)
+        .any(|a| *a == "exec")
+}
+
 fn parent_pid() -> Option<u32> {
     // The hook subprocess's parent is the harness process itself.
     std::fs::read_to_string("/proc/self/stat")
@@ -240,6 +283,18 @@ mod tests {
         );
         assert_eq!(tmux_socket_path(",1,0"), None);
         assert_eq!(tmux_socket_path(""), None);
+    }
+
+    #[test]
+    fn detects_codex_exec_invocations() {
+        assert!(cmdline_is_codex_exec(&["codex", "exec", "do a thing"]));
+        assert!(cmdline_is_codex_exec(&["/usr/bin/codex", "exec"]));
+        // node shim wrapping the real binary.
+        assert!(cmdline_is_codex_exec(&["node", "/x/codex-linux-x64/codex", "exec", "prompt"]));
+        // Interactive TUI (no exec subcommand) is NOT headless.
+        assert!(!cmdline_is_codex_exec(&["codex"]));
+        assert!(!cmdline_is_codex_exec(&["codex", "--model", "gpt-5"]));
+        assert!(!cmdline_is_codex_exec(&["bash", "-c", "something"]));
     }
 
     #[test]

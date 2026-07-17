@@ -179,14 +179,20 @@ async fn focus_crew(
                 return;
             }
             tmux::TmuxResult::NoClients { session } => {
-                info!("crew session {session:?} has no attached client; spawning attach");
+                info!("crew session {session:?} has no attached client");
             }
             tmux::TmuxResult::Failed(why) => {
-                debug!("crew tmux switch failed ({why}); spawning attach");
+                debug!("crew tmux switch failed ({why})");
             }
         }
     }
-    spawn_terminal(cfg, town_dir, &["gt", "crew", "attach", name, "--rig", rig], key);
+    // No live client. Only open a new terminal if explicitly enabled — a
+    // surprise terminal on click is worse than a no-op.
+    if cfg.spawn_on_focus {
+        spawn_terminal(cfg, town_dir, &["gt", "crew", "attach", name, "--rig", rig], key);
+    } else {
+        info!("crew {rig}/{name} not loaded; attach with: gt crew attach {name} --rig {rig}");
+    }
 }
 
 /// Mayor console (also the escalation target): switch an attached client
@@ -213,15 +219,17 @@ async fn focus_mayor(
                 switched = true;
             }
             tmux::TmuxResult::NoClients { session } => {
-                info!("mayor session {session:?} has no attached client; spawning attach");
+                info!("mayor session {session:?} has no attached client");
             }
             tmux::TmuxResult::Failed(why) => {
-                debug!("mayor tmux switch failed ({why}); spawning attach");
+                debug!("mayor tmux switch failed ({why})");
             }
         }
     }
-    if !switched {
+    if !switched && cfg.spawn_on_focus {
         spawn_terminal(cfg, town_dir, &["gt", "mayor", "attach"], key);
+    } else if !switched {
+        info!("mayor not loaded; attach with: gt mayor attach");
     }
     if escalation && cfg.escalation_draft {
         match (hints, body) {

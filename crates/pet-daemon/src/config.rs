@@ -30,6 +30,11 @@ pub struct FocusConfig {
     /// Draft (never submit) escalation context into the mayor's pane on an
     /// escalation click.
     pub escalation_draft: bool,
+    /// Open a NEW terminal to attach a crew/mayor session that has no live
+    /// client. Off by default: a click surprising you with a fresh terminal
+    /// is worse than a no-op. When off, focus only switches to already-live
+    /// windows/clients.
+    pub spawn_on_focus: bool,
 }
 
 impl Default for FocusConfig {
@@ -37,6 +42,7 @@ impl Default for FocusConfig {
         Self {
             terminal: "kitty".into(),
             escalation_draft: true,
+            spawn_on_focus: false,
         }
     }
 }

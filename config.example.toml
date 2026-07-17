@@ -23,3 +23,8 @@
 #poll_secs = 15
 #town_dir = "/home/you/agent-town/town"
 #include_polecats = false
+
+[focus]
+#terminal = "kitty"
+#escalation_draft = true
+#spawn_on_focus = false
