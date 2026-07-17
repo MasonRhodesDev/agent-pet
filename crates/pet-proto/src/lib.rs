@@ -10,7 +10,7 @@ pub mod snapshot;
 
 pub use event::{AgentState, Event, Meta, Source, Via, PROTOCOL_VERSION};
 pub use key::SessionKey;
-pub use snapshot::{SessionView, Snapshot, UiAction};
+pub use snapshot::{ActiveWindow, SessionView, Snapshot, UiAction};
 
 /// Well-known D-Bus identity for the daemon.
 pub const BUS_NAME: &str = "io.github.masonrhodesdev.AgentPet";

@@ -338,7 +338,7 @@ async fn focus_tmux(socket: &str, pane: &str) -> Outcome {
     }
 }
 
-fn parse_kitty_pane(pane: &str) -> Option<(u32, u32)> {
+pub(crate) fn parse_kitty_pane(pane: &str) -> Option<(u32, u32)> {
     let rest = pane.strip_prefix("kitty-")?;
     let (pid, win) = rest.split_once('-')?;
     Some((pid.parse().ok()?, win.parse().ok()?))

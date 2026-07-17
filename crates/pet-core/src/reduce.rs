@@ -28,6 +28,7 @@ pub fn reduce(model: &Model, now_ms: i64) -> Snapshot {
             since: s.since,
             seen: s.seen,
             via: s.via,
+            focused: model.focused.as_ref() == Some(key),
             body: s.body.clone(),
             meta: s.meta.clone(),
         })
@@ -39,14 +40,19 @@ pub fn reduce(model: &Model, now_ms: i64) -> Snapshot {
             .then(b.since.cmp(&a.since))
     });
 
+    // The focused session stays listed in the tray but does not drive the
+    // mascot: you are already looking at it.
     let top = sessions
         .iter()
+        .filter(|s| !s.focused)
         .map(|s| (priority(s.state, s.seen), s.state))
         .max_by_key(|(p, _)| *p)
         .filter(|(p, _)| *p >= 2)
         .map(|(_, state)| state)
         .unwrap_or(AgentState::Idle);
 
+    // Unread still counts the focused session — it is genuinely unacknowledged
+    // until seen; only the mascot/bubble nag is suppressed.
     let unread = sessions
         .iter()
         .filter(|s| !s.seen && matches!(s.state, AgentState::Ready | AgentState::Failed))

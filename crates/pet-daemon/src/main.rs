@@ -7,6 +7,7 @@
 mod bus;
 mod config;
 mod effects;
+mod focus_join;
 mod gastown;
 mod persist;
 mod runtime;
@@ -76,6 +77,10 @@ async fn main() -> anyhow::Result<()> {
         tokio::sync::watch::channel(std::sync::Arc::new(pet_proto::Snapshot::default()));
     let (control_tx, control_rx) = tokio::sync::watch::channel(pet_render::Control::default());
     let (ui_tx, mut ui_rx) = tokio::sync::mpsc::unbounded_channel::<pet_proto::UiAction>();
+    // Active-window facts need the Model (session metas) to join, so they go
+    // to the runtime rather than being mapped inline like other UiActions.
+    let (focus_tx, focus_rx) =
+        tokio::sync::mpsc::unbounded_channel::<Option<pet_proto::ActiveWindow>>();
 
     let connection = zbus::connection::Builder::session()?
         .serve_at(
@@ -148,6 +153,11 @@ async fn main() -> anyhow::Result<()> {
                     None
                 }
                 pet_proto::UiAction::MarkAllSeen => Some(pet_core::Input::SeenAll),
+                pet_proto::UiAction::ActiveWindowChanged { window } => {
+                    // Joined against the Model in the runtime.
+                    let _ = focus_tx.send(window);
+                    None
+                }
                 // Visibility is renderer-owned; settings/quit are later
                 // milestones.
                 pet_proto::UiAction::SetVisible { .. }
@@ -164,6 +174,7 @@ async fn main() -> anyhow::Result<()> {
         config,
         model,
         input_rx,
+        focus_rx,
         snapshot_tx,
         iface,
     ));

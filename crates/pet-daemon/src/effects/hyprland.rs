@@ -110,13 +110,13 @@ pub async fn focus_by_ancestry(pid: u32) -> Result<(), String> {
         .map_err(|e| format!("focuswindow address:{addr}: {e}"))
 }
 
-fn read_proc_stat(pid: u32) -> Option<String> {
+pub(crate) fn read_proc_stat(pid: u32) -> Option<String> {
     std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()
 }
 
 /// Walk the ppid chain starting at (and including) `pid`, capped at
 /// `MAX_ANCESTRY_HOPS`. `read_stat` is injected so the walk is testable.
-fn ancestry_chain(pid: u32, read_stat: impl Fn(u32) -> Option<String>) -> Vec<u32> {
+pub(crate) fn ancestry_chain(pid: u32, read_stat: impl Fn(u32) -> Option<String>) -> Vec<u32> {
     let mut chain = vec![pid];
     let mut cur = pid;
     for _ in 0..MAX_ANCESTRY_HOPS {

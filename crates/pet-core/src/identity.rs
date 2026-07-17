@@ -148,4 +148,7 @@ pub fn wrapper_verdict(
 pub fn remove_session(model: &mut Model, key: &SessionKey) {
     model.sessions.remove(key);
     model.aliases.retain(|_, target| target != key);
+    if model.focused.as_ref() == Some(key) {
+        model.focused = None;
+    }
 }

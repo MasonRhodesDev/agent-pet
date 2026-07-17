@@ -27,10 +27,30 @@ pub struct SessionView {
     /// Wrapper that observes this session, when it is not a direct feed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub via: Option<Source>,
+    /// The user is currently looking at this session's window: it stays in
+    /// the tray but no longer drives the mascot or the bubble.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub focused: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub body: Option<String>,
     #[serde(default)]
     pub meta: Meta,
+}
+
+/// A compositor's currently-active toplevel window, reported by the renderer
+/// for focus-aware suppression. `pid` is present on Hyprland (socket1
+/// activewindow) and absent on the generic wlr foreign-toplevel path, which
+/// only exposes app_id/title.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ActiveWindow {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub address: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
 }
 
 /// Actions the renderer (or CLI) can request from the daemon. The renderer
@@ -45,6 +65,9 @@ pub enum UiAction {
     /// (right-click hide today; tray close later). Informational — the
     /// renderer owns and persists visibility.
     SetVisible { visible: bool },
+    /// The active toplevel changed (already debounced by the renderer).
+    /// `None` = focus left every tracked session's window.
+    ActiveWindowChanged { window: Option<ActiveWindow> },
     OpenSettings,
     Quit,
 }
@@ -63,6 +86,7 @@ mod tests {
                 since: 123,
                 seen: false,
                 via: None,
+                focused: true,
                 body: Some("Permission".into()),
                 meta: Meta::default(),
             }],
@@ -72,6 +96,22 @@ mod tests {
         let json = serde_json::to_string(&snap).unwrap();
         let back: Snapshot = serde_json::from_str(&json).unwrap();
         assert_eq!(back, snap);
+    }
+
+    #[test]
+    fn active_window_round_trips() {
+        let w = ActiveWindow {
+            pid: Some(4242),
+            address: Some("0x5f".into()),
+            app_id: Some("kitty".into()),
+            title: Some("claude".into()),
+        };
+        let back: ActiveWindow = serde_json::from_str(&serde_json::to_string(&w).unwrap()).unwrap();
+        assert_eq!(back, w);
+        // Foreign-toplevel: no pid.
+        let w = ActiveWindow { app_id: Some("firefox".into()), ..Default::default() };
+        let back: ActiveWindow = serde_json::from_str(&serde_json::to_string(&w).unwrap()).unwrap();
+        assert_eq!(back, w);
     }
 
     #[test]

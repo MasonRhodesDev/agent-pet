@@ -55,6 +55,16 @@ pub fn step(model: &mut Model, input: Input, now_ms: i64) -> Vec<Effect> {
             }
             return effects;
         }
+        Input::FocusChanged(key) => {
+            // Display-only: republish so the mascot/bubble drop the focused
+            // session. No persist (transient), no tick.
+            let resolved = key.map(|k| identity::resolve(model, &k));
+            if model.focused == resolved {
+                return Vec::new();
+            }
+            model.focused = resolved;
+            return vec![Effect::PublishSnapshot];
+        }
     };
 
     if !changed {

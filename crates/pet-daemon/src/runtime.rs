@@ -20,6 +20,7 @@ pub async fn run(
     config: Config,
     mut model: Model,
     mut inputs: mpsc::UnboundedReceiver<Input>,
+    mut focus_facts: mpsc::UnboundedReceiver<Option<pet_proto::ActiveWindow>>,
     snapshot_tx: watch::Sender<Arc<Snapshot>>,
     iface: InterfaceRef<PetBus>,
 ) {
@@ -55,6 +56,21 @@ pub async fn run(
             _ = sleep_until_opt(tick_at), if tick_at.is_some() => {
                 tick_at = None;
                 let effects = step(&mut model, Input::Tick, now_ms());
+                execute(effects, &config, &model, &snapshot_tx, &iface, &mut tick_at, &mut persist_at).await;
+            }
+            fact = focus_facts.recv() => {
+                let Some(window) = fact else { continue };
+                // Join the active window to a session (or None), then let the
+                // pure FSM decide suppression.
+                let key = window.as_ref().and_then(|w| {
+                    let metas = model
+                        .sessions
+                        .iter()
+                        .map(|(k, s)| (k.clone(), s.meta.clone()))
+                        .collect();
+                    crate::focus_join::resolve_live(w, &metas)
+                });
+                let effects = step(&mut model, Input::FocusChanged(key), now_ms());
                 execute(effects, &config, &model, &snapshot_tx, &iface, &mut tick_at, &mut persist_at).await;
             }
             _ = sleep_until_opt(persist_at), if persist_at.is_some() => {

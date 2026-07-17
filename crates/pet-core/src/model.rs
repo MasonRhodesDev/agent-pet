@@ -15,6 +15,11 @@ pub struct Model {
     pub aliases: BTreeMap<SessionKey, SessionKey>,
     #[serde(default)]
     pub ttls: Ttls,
+    /// The session whose window the user is currently looking at. Transient
+    /// UI state — never persisted (a stale focus could wrongly suppress on
+    /// boot). Demoted from the mascot/bubble by `reduce`, kept in the tray.
+    #[serde(skip)]
+    pub focused: Option<SessionKey>,
 }
 
 /// One tracked session's state machine.
@@ -60,6 +65,9 @@ pub enum Input {
     SeenAll,
     /// Marks seen and asks the shell to focus the session's window.
     FocusRequested(SessionKey),
+    /// The active window now maps to this session (or `None` when focus left
+    /// every tracked session). Suppresses that session's mascot/bubble nag.
+    FocusChanged(Option<SessionKey>),
 }
 
 /// Effects are data; the daemon shell executes them. Nothing in pet-core
