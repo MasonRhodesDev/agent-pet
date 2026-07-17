@@ -130,23 +130,31 @@ impl WalkDir {
 }
 
 /// Decides the walk direction from the drag's *smoothed* horizontal
-/// velocity, so hand jitter while dragging one way doesn't flip the sprite
-/// back and forth. Direction only changes when the exponential moving
-/// average of per-motion travel clearly reverses past a dead zone.
+/// velocity so hand jitter doesn't flip the sprite back and forth. Two
+/// layers of smoothing: an EMA of per-motion travel (with a dead zone), and
+/// a confirmation debounce — the opposite direction must persist for several
+/// consecutive samples before the sprite actually flips, so a single-frame
+/// outlier (a fast twitch) can never cause a flip.
 #[derive(Debug, Clone, Copy)]
 pub struct Walk {
     last_x: i32,
     /// EMA of horizontal travel per motion (px), signed.
     vel: f64,
     dir: Option<WalkDir>,
+    /// Candidate direction awaiting confirmation, and how many consecutive
+    /// samples have favored it.
+    pending: Option<WalkDir>,
+    pending_count: u32,
 }
 
 /// EMA weight of the newest sample. Lower = smoother / more history.
-const VEL_ALPHA: f64 = 0.2;
-/// Smoothed velocity magnitude needed to commit/hold a direction. Between
-/// −FLIP and +FLIP the current direction is kept (the dead zone that stops
-/// the flip-flop).
+const VEL_ALPHA: f64 = 0.15;
+/// Smoothed velocity magnitude needed to favor a direction. Between −FLIP and
+/// +FLIP the current direction is kept (dead zone).
 const VEL_FLIP: f64 = 1.0;
+/// Consecutive samples the opposite direction must hold before the sprite
+/// flips. Kills single-frame flips from an outlier sample.
+const CONFIRM_SAMPLES: u32 = 4;
 
 impl Walk {
     pub fn new(start_x: i32) -> Self {
@@ -154,26 +162,47 @@ impl Walk {
             last_x: start_x,
             vel: 0.0,
             dir: None,
+            pending: None,
+            pending_count: 0,
         }
     }
 
-    /// Feed the current mascot x. Returns `Some(dir)` only when the smoothed
+    /// Feed the current mascot x. Returns `Some(dir)` only when the confirmed
     /// direction actually changes, so the caller can switch the looping walk
     /// track without restarting it every frame.
     pub fn update(&mut self, x: i32) -> Option<WalkDir> {
         let dx = (x - self.last_x) as f64;
         self.last_x = x;
         self.vel = VEL_ALPHA * dx + (1.0 - VEL_ALPHA) * self.vel;
-        let new = if self.vel >= VEL_FLIP {
-            WalkDir::Right
+
+        // Instantaneous candidate from the smoothed velocity.
+        let candidate = if self.vel >= VEL_FLIP {
+            Some(WalkDir::Right)
         } else if self.vel <= -VEL_FLIP {
-            WalkDir::Left
+            Some(WalkDir::Left)
         } else {
-            return None; // dead zone: keep the current direction
+            None // dead zone
         };
-        if Some(new) != self.dir {
-            self.dir = Some(new);
-            Some(new)
+
+        // No candidate, or already walking that way: reset the pending flip.
+        if candidate.is_none() || candidate == self.dir {
+            self.pending = None;
+            self.pending_count = 0;
+            return None;
+        }
+
+        // A candidate opposite the current direction must persist to flip.
+        if self.pending == candidate {
+            self.pending_count += 1;
+        } else {
+            self.pending = candidate;
+            self.pending_count = 1;
+        }
+        if self.pending_count >= CONFIRM_SAMPLES {
+            self.dir = candidate;
+            self.pending = None;
+            self.pending_count = 0;
+            candidate
         } else {
             None
         }
@@ -181,6 +210,11 @@ impl Walk {
 
     pub fn dir(&self) -> Option<WalkDir> {
         self.dir
+    }
+
+    /// Smoothed horizontal velocity (px/motion, signed) — for drag telemetry.
+    pub fn vel(&self) -> f64 {
+        self.vel
     }
 }
 
