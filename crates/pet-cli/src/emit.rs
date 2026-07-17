@@ -86,6 +86,11 @@ fn transcript_tail(path: &str) -> Option<String> {
         let Some(blocks) = content.and_then(|c| c.as_array()) else {
             continue;
         };
+        // A pending AskUserQuestion is the actual thing needing input — show
+        // the question, not "needs permission to use AskUserQuestion".
+        if let Some(q) = blocks.iter().find_map(ask_user_question) {
+            return Some(q);
+        }
         let text: Vec<&str> = blocks
             .iter()
             .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("text"))
@@ -96,6 +101,31 @@ fn transcript_tail(path: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Extract the question text from an `AskUserQuestion` tool_use block, if that
+/// is what this content block is. Prefers the first question's `question`,
+/// falling back to its `header`.
+fn ask_user_question(block: &serde_json::Value) -> Option<String> {
+    if block.get("type").and_then(|t| t.as_str()) != Some("tool_use")
+        || block.get("name").and_then(|n| n.as_str()) != Some("AskUserQuestion")
+    {
+        return None;
+    }
+    let questions = block
+        .get("input")
+        .and_then(|i| i.get("questions"))
+        .and_then(|q| q.as_array())?;
+    let first = questions.first()?;
+    let q = first
+        .get("question")
+        .or_else(|| first.get("header"))
+        .and_then(|t| t.as_str())?;
+    Some(if questions.len() > 1 {
+        format!("{q} (+{} more)", questions.len() - 1)
+    } else {
+        q.to_string()
+    })
 }
 
 fn read_stdin() -> anyhow::Result<String> {
@@ -256,6 +286,17 @@ mod tests {
         assert_eq!(
             transcript_tail(f.path().to_str().unwrap()).as_deref(),
             Some("prior good line")
+        );
+    }
+
+    #[test]
+    fn transcript_tail_extracts_askuserquestion() {
+        let f = write_transcript(&[
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Let me ask."},{"type":"tool_use","name":"AskUserQuestion","input":{"questions":[{"question":"Which DB?","header":"DB"},{"question":"Which region?"}]}}]}}"#,
+        ]);
+        assert_eq!(
+            transcript_tail(f.path().to_str().unwrap()).as_deref(),
+            Some("Which DB? (+1 more)")
         );
     }
 

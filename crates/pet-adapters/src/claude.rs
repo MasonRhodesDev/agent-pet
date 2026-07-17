@@ -48,6 +48,13 @@ pub fn is_permission_message(message: &str) -> bool {
     m.contains("permission") || m.contains("approve") || m.contains("wants to")
 }
 
+/// Is this notification actually a multiple-choice question (AskUserQuestion)
+/// dressed up as a permission prompt? Those need input, but "needs permission
+/// to use AskUserQuestion" is misleading — we surface the real question.
+pub fn is_question_prompt(message: &str) -> bool {
+    message.to_ascii_lowercase().contains("askuserquestion")
+}
+
 /// Map a hook payload to an event. `agent_pid` is the harness process id (the
 /// emitter's parent). `tail` is the last assistant message the emitter read
 /// from the transcript (kept out of this pure fn). Returns `None` for hook
@@ -68,6 +75,12 @@ pub fn map_hook(
         ),
         "PostToolUse" => (AgentState::Running, payload.tool_name.clone()),
         "Notification" => match payload.message.as_deref() {
+            // A multiple-choice question needs input, but its permission
+            // wording is useless — show the actual question (from the tail).
+            Some(m) if is_question_prompt(m) => (
+                AgentState::Waiting,
+                tail_body.clone().or_else(|| hygiene::body(m)),
+            ),
             // A real permission/approval prompt genuinely blocks progress →
             // needs-input (the persistent nag is warranted). Keep its text.
             Some(m) if is_permission_message(m) => (AgentState::Waiting, hygiene::body(m)),
@@ -192,5 +205,18 @@ mod tests {
         let ev = map_hook(&json, None, None).unwrap().unwrap();
         use unicode_segmentation::UnicodeSegmentation;
         assert!(ev.body.unwrap().graphemes(true).count() <= hygiene::BODY_MAX);
+    }
+
+    #[test]
+    fn askuserquestion_shows_the_question_not_permission() {
+        // The notification's "permission to use AskUserQuestion" wording is
+        // replaced by the actual question from the transcript tail, but it
+        // still counts as needs-input.
+        let n = r#"{"hook_event_name":"Notification","session_id":"s","message":"Claude needs your permission to use AskUserQuestion"}"#;
+        let ev = map_hook(n, None, Some("Which database should we use?".into()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(ev.state, AgentState::Waiting);
+        assert_eq!(ev.body.as_deref(), Some("Which database should we use?"));
     }
 }
