@@ -54,6 +54,17 @@ impl Timeline {
         }
     }
 
+    /// Play a track looping indefinitely (no burst, no settle) until the next
+    /// request. Used for the drag-walk override, which persists as long as
+    /// the pet is being dragged sideways. No-op if already the requested track.
+    pub fn request_loop(&mut self, track: &str, now_ms: u64) {
+        if track == self.requested {
+            return;
+        }
+        self.requested = track.to_string();
+        self.enter(track, None, now_ms);
+    }
+
     /// Step past any elapsed frame deadlines. Returns true if the visible
     /// sprite may have changed.
     pub fn advance(&mut self, now_ms: u64) -> bool {
@@ -297,5 +308,30 @@ mod tests {
         let mut tl = Timeline::new(&idle_only(), 0);
         tl.request_state("running", 0);
         assert_eq!(tl.current_track(), "idle");
+    }
+
+    #[test]
+    fn request_loop_plays_a_track_indefinitely_without_settling() {
+        let p = pet(&[
+            ("idle", &[(0, 100)], Some(0), "idle"),
+            ("running-right", &[(8, 100), (9, 100)], Some(0), "idle"),
+            ("running-left", &[(16, 100), (17, 100)], Some(0), "idle"),
+        ]);
+        let mut tl = Timeline::new(&p, 0);
+        tl.request_loop("running-right", 0);
+        assert_eq!(tl.current_track(), "running-right");
+        // Loops well past 3 passes (a burst would have settled to idle).
+        for t in (100..=1200).step_by(100) {
+            tl.advance(t as u64);
+            assert_eq!(tl.current_track(), "running-right", "at t={t}");
+        }
+        // Repeated same-direction request does not restart.
+        tl.advance(1250);
+        let before = tl.sprite_index();
+        tl.request_loop("running-right", 1250);
+        assert_eq!(tl.sprite_index(), before);
+        // Switching direction switches immediately.
+        tl.request_loop("running-left", 1300);
+        assert_eq!(tl.current_track(), "running-left");
     }
 }

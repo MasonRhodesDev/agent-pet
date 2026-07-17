@@ -120,6 +120,68 @@ impl Drag {
     }
 }
 
+/// Which way the pet "walks" while being dragged, matching the app's
+/// per-move deltaX sign with a 4px hysteresis so it doesn't flicker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WalkDir {
+    Left,
+    Right,
+}
+
+impl WalkDir {
+    /// The looping animation track for this walk direction.
+    pub fn track(self) -> &'static str {
+        match self {
+            WalkDir::Left => "running-left",
+            WalkDir::Right => "running-right",
+        }
+    }
+}
+
+/// Tracks the drag's horizontal travel and decides the walk direction.
+#[derive(Debug, Clone, Copy)]
+pub struct Walk {
+    ref_x: i32,
+    dir: Option<WalkDir>,
+}
+
+/// Net horizontal move (px) before the walk direction flips.
+const WALK_THRESHOLD: i32 = 4;
+
+impl Walk {
+    pub fn new(start_x: i32) -> Self {
+        Self {
+            ref_x: start_x,
+            dir: None,
+        }
+    }
+
+    /// Feed the current mascot x. Returns `Some(dir)` only when the walk
+    /// direction changes (>= 4px net move since the last change), so the
+    /// caller can switch the looping walk track without restarting it.
+    pub fn update(&mut self, x: i32) -> Option<WalkDir> {
+        let dx = x - self.ref_x;
+        let new = if dx >= WALK_THRESHOLD {
+            WalkDir::Right
+        } else if dx <= -WALK_THRESHOLD {
+            WalkDir::Left
+        } else {
+            return None; // within hysteresis: keep the current direction
+        };
+        self.ref_x = x;
+        if Some(new) != self.dir {
+            self.dir = Some(new);
+            Some(new)
+        } else {
+            None
+        }
+    }
+
+    pub fn dir(&self) -> Option<WalkDir> {
+        self.dir
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -208,5 +270,30 @@ mod tests {
         assert_eq!(drag.release(), Release::Dropped);
         assert_eq!(drag.drag_pos(), None);
         assert_eq!(drag, Drag::Idle);
+    }
+
+    #[test]
+    fn walk_direction_follows_horizontal_travel_with_hysteresis() {
+        let mut walk = Walk::new(100);
+        assert_eq!(walk.dir(), None);
+        // Small moves stay under threshold: no walk yet.
+        assert_eq!(walk.update(102), None);
+        assert_eq!(walk.update(103), None);
+        // Cross +4 from ref -> Right (fires once).
+        assert_eq!(walk.update(104), Some(WalkDir::Right));
+        // Continuing right is the same direction: no re-fire.
+        assert_eq!(walk.update(140), None);
+        assert_eq!(walk.dir(), Some(WalkDir::Right));
+        // A small back-step within hysteresis doesn't flip.
+        assert_eq!(walk.update(138), None);
+        // A 4px net reversal flips to Left.
+        assert_eq!(walk.update(134), Some(WalkDir::Left));
+        assert_eq!(walk.dir(), Some(WalkDir::Left));
+    }
+
+    #[test]
+    fn walk_tracks_map_to_running_rows() {
+        assert_eq!(WalkDir::Right.track(), "running-right");
+        assert_eq!(WalkDir::Left.track(), "running-left");
     }
 }

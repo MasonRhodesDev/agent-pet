@@ -34,7 +34,7 @@ use crate::compose::{self, Geometry};
 use crate::compositor::settle::{Action as SettleAction, Settle, DEFAULT_SETTLE_MS};
 use crate::compositor::wlr_generic::Wlr;
 use crate::compositor::{self, ActiveWindowSource, SourceCtx};
-use crate::input::drag::Drag;
+use crate::input::drag::{Drag, Walk};
 use crate::input::router::{Clicks, Cursor, Rect};
 use crate::sprite::pet_json::{resolve_pet_dir, PetDef};
 use crate::sprite::semantics;
@@ -72,6 +72,8 @@ pub struct App {
     pub drag_frame_pending: bool,
     /// The drag position changed since the last drag render.
     pub drag_dirty: bool,
+    /// Horizontal-travel tracker: drives the walk animation while dragging.
+    pub walk: Option<Walk>,
     pub pointer: Option<WlPointer>,
     /// cursor-shape-v1: absent when the compositor lacks the global —
     /// degrade to no cursor changes. TODO(render-v1): wayland-cursor theme
@@ -167,6 +169,7 @@ pub fn run(
         clicks: Clicks::default(),
         drag_frame_pending: false,
         drag_dirty: false,
+        walk: None,
         pointer: None,
         cursor_shapes: bound.cursor_shapes,
         shape_device: None,
@@ -297,8 +300,13 @@ impl App {
         if snapshot.top != self.last_state {
             debug!(from = ?self.last_state, to = ?snapshot.top, "mascot state change");
             self.last_state = snapshot.top;
-            let track = semantics::track_for(snapshot.top, &self.pet);
-            self.timeline.request_state(track, self.now_ms());
+            // The drag walk (transientState) overrides the base state; only
+            // drive the timeline when not dragging. The base track is
+            // restored on release from `last_state`.
+            if !self.drag.dragging() {
+                let track = semantics::track_for(snapshot.top, &self.pet);
+                self.timeline.request_state(track, self.now_ms());
+            }
             changed = true;
         }
         // Reveal progress is keyed on content identity inside AlertBubble:
@@ -357,23 +365,25 @@ impl App {
         }
     }
 
+    /// Whether a gesture/state track exists and has visible art. Gates the
+    /// gesture animations so a pet with a blank row (the default pet leaves
+    /// rows 1-4 transparent) never plays nothing.
+    fn track_has_art(&self, track: &str) -> bool {
+        self.pet.animations.get(track).is_some_and(|a| {
+            self.sheet
+                .any_visible(a.frames.iter().map(|f| f.sprite_index))
+        })
+    }
+
     /// First-awake greeting: on the reveal edge, wave once (burst 3x ->
     /// idle). Skipped when something is already pending (the alert takes
-    /// precedence) or when the pet has no waving art (the default pet leaves
-    /// row 3 blank). One-time per daemon run.
+    /// precedence) or when the pet has no waving art. One-time per run.
     pub(crate) fn maybe_greet(&mut self) {
         if self.greeted {
             return;
         }
         self.greeted = true;
-        if self.last_state != AgentState::Idle {
-            return;
-        }
-        let Some(waving) = self.pet.animations.get("waving") else {
-            return;
-        };
-        let indices: Vec<usize> = waving.frames.iter().map(|f| f.sprite_index).collect();
-        if self.sheet.any_visible(indices) {
+        if self.last_state == AgentState::Idle && self.track_has_art("waving") {
             debug!("first-awake greeting wave");
             self.timeline.request_state("waving", self.now_ms());
         }
@@ -575,21 +585,31 @@ impl App {
     pub(crate) fn begin_drag(&mut self) {
         self.drag_frame_pending = false;
         self.drag_dirty = false;
+        // Only walk if the pet has directional walk art (both rows); the
+        // default pet's rows 1-2 are blank, so it slides on its base track.
+        self.walk = (self.track_has_art("running-right") && self.track_has_art("running-left"))
+            .then(|| Walk::new(self.position.margin_x));
         if let Err(e) = self.mascot.enter_drag(&self.compositor_state) {
             warn!("enter drag surface failed: {e:#}");
+            self.walk = None;
             self.drag.release();
         }
     }
 
-    /// A drag motion in full-output (== output) coords. Records the target
+    /// A drag motion in full-output (== output) coords. Records the target,
+    /// updates the walk direction (transientState overrides the base state),
     /// and schedules a frame-rate-limited render.
     pub(crate) fn on_drag_motion(&mut self, pointer: (f64, f64)) {
-        if self.drag.drag_to(pointer).is_some() {
-            if self.drag_frame_pending {
-                self.drag_dirty = true;
-            } else {
-                self.drag_render();
-            }
+        let Some((x, _)) = self.drag.drag_to(pointer) else {
+            return;
+        };
+        if let Some(dir) = self.walk.as_mut().and_then(|w| w.update(x)) {
+            self.timeline.request_loop(dir.track(), self.now_ms());
+        }
+        if self.drag_frame_pending {
+            self.drag_dirty = true;
+        } else {
+            self.drag_render();
         }
     }
 
@@ -636,6 +656,11 @@ impl App {
         self.position.output_name = self.output_name();
         self.drag_frame_pending = false;
         self.drag_dirty = false;
+        // Stop walking and return to the base state (restored from last_state,
+        // which kept updating from snapshots during the drag).
+        self.walk = None;
+        let base = semantics::track_for(self.last_state, &self.pet);
+        self.timeline.request_state(base, self.now_ms());
         if let Err(e) = self.mascot.exit_drag(&self.compositor_state, &self.position) {
             warn!("exit drag surface failed: {e:#}");
         }
