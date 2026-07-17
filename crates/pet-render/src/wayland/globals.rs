@@ -88,8 +88,8 @@ impl CompositorHandler for App {
         _time: u32,
     ) {
         // Animation is timer-driven at sprite cadence; frame callbacks are
-        // only requested by the drag apply loop.
-        self.drag_apply_step();
+        // only requested by the drag render loop.
+        self.on_frame_callback();
     }
 
     fn surface_enter(

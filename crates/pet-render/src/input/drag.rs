@@ -1,11 +1,24 @@
-//! Pure drag FSM: click-vs-drag threshold + coalesced delta-margins math.
+//! Pure drag FSM: click-vs-drag threshold + absolute-offset math.
 //!
-//! Motion events only stash the latest surface-local position; the surface
-//! actually moves once per compositor frame callback via [`Drag::take_pending`],
-//! which measures the stash against the LAST APPLIED position and rebases.
-//! Applying margins per motion event instead double-counts movement the
-//! compositor has not committed yet (margin commits land asynchronously),
-//! so the pet drifts away from the pointer.
+//! Why absolute, not accumulated deltas: `wl_pointer` reports SURFACE-LOCAL
+//! coordinates, and a compositor does NOT emit a synthetic motion when a
+//! surface slides under a stationary cursor. So any scheme that moves the
+//! mascot's own small surface during a drag feeds on corrupted coordinates
+//! (the surface origin shifts under the pointer) and the pet trails/snaps.
+//!
+//! The fix (driven by the renderer, not this module): during a drag the
+//! surface is expanded to cover the whole output and held STATIONARY, so
+//! surface-local == output coordinates. This FSM then just tracks an
+//! absolute offset from a grab point recorded in that stationary space:
+//! `pos = start_pos + (pointer - grab)`. No accumulation, no rebasing, no
+//! feedback — exact 1:1.
+//!
+//! Two coordinate spaces are involved and never mixed:
+//!   - pre-threshold (`Pressed`): the small docked surface's local coords,
+//!     used only for the 4 px threshold test.
+//!   - dragging (`Dragging`): the stationary full-output surface's local
+//!     coords (== output coords). `grab` is captured lazily from the first
+//!     such motion, so the docked→full-output transition never corrupts it.
 
 /// Squared click-vs-drag threshold (~4 px).
 const THRESHOLD_SQ: f64 = 16.0;
@@ -13,17 +26,18 @@ const THRESHOLD_SQ: f64 = 16.0;
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Drag {
     Idle,
-    /// Button down, not yet past the threshold.
-    Pressed {
-        grab: (f64, f64),
-        origin: (i32, i32),
-        latest: (f64, f64),
-    },
+    /// Button down, not yet past the threshold (docked surface-local coords).
+    Pressed { grab: (f64, f64), origin: (i32, i32) },
+    /// Past the threshold; the renderer has (or is) switching to the
+    /// full-output surface. `grab` is captured from the first full-output
+    /// motion so the two coordinate spaces never mix.
     Dragging {
-        grab: (f64, f64),
-        /// Last position handed out by `take_pending`.
-        applied: (i32, i32),
-        latest: (f64, f64),
+        /// Mascot top-left on the output at grab time.
+        start_pos: (i32, i32),
+        /// Output-space grab point, established on first drag motion.
+        grab: Option<(f64, f64)>,
+        /// Current (unclamped) mascot top-left on the output.
+        pos: (i32, i32),
     },
 }
 
@@ -36,67 +50,57 @@ pub enum Release {
 }
 
 impl Drag {
-    /// `position` is the mascot's current logical top-left on the output.
+    /// Button press. `position` is the mascot's current top-left on the
+    /// output; `pointer` is docked surface-local.
     pub fn press(&mut self, pointer: (f64, f64), position: (i32, i32)) {
         *self = Drag::Pressed {
             grab: pointer,
             origin: position,
-            latest: pointer,
         };
     }
 
-    /// Stash the latest pointer position. Returns true exactly once, when
-    /// the threshold is first crossed — the caller starts the frame-callback
-    /// apply loop then.
-    pub fn motion(&mut self, pointer: (f64, f64)) -> bool {
-        match *self {
-            Drag::Idle => false,
-            Drag::Pressed { grab, origin, .. } => {
-                let (dx, dy) = (pointer.0 - grab.0, pointer.1 - grab.1);
-                if dx * dx + dy * dy <= THRESHOLD_SQ {
-                    *self = Drag::Pressed {
-                        grab,
-                        origin,
-                        latest: pointer,
-                    };
-                    return false;
-                }
+    /// Pre-drag motion in docked surface-local coords. Returns true exactly
+    /// once, when the click-vs-drag threshold is first crossed (transition to
+    /// `Dragging`); the caller then switches to the full-output surface.
+    pub fn threshold_crossed(&mut self, pointer: (f64, f64)) -> bool {
+        if let Drag::Pressed { grab, origin } = *self {
+            let (dx, dy) = (pointer.0 - grab.0, pointer.1 - grab.1);
+            if dx * dx + dy * dy > THRESHOLD_SQ {
                 *self = Drag::Dragging {
-                    grab,
-                    applied: origin,
-                    latest: pointer,
+                    start_pos: origin,
+                    grab: None,
+                    pos: origin,
                 };
-                true
+                return true;
             }
-            Drag::Dragging { grab, applied, .. } => {
-                *self = Drag::Dragging {
-                    grab,
-                    applied,
-                    latest: pointer,
-                };
-                false
-            }
+        }
+        false
+    }
+
+    /// Drag motion in the stationary full-output surface's coords (== output
+    /// coords). Establishes the grab on first call (sprite does not jump),
+    /// then tracks 1:1. Returns the new unclamped mascot top-left, or `None`
+    /// when not dragging.
+    pub fn drag_to(&mut self, pointer: (f64, f64)) -> Option<(i32, i32)> {
+        if let Drag::Dragging {
+            start_pos,
+            grab,
+            pos,
+        } = self
+        {
+            let g = grab.get_or_insert(pointer);
+            pos.0 = start_pos.0 + (pointer.0 - g.0).round() as i32;
+            pos.1 = start_pos.1 + (pointer.1 - g.1).round() as i32;
+            Some(*pos)
+        } else {
+            None
         }
     }
 
-    /// Consume the coalesced delta: the next position to apply, measured
-    /// against the last applied one. Rebases the stash so the same movement
-    /// is never applied twice (after the surface moves, a stationary pointer
-    /// reads back as the grab point).
-    pub fn take_pending(&mut self) -> Option<(i32, i32)> {
+    /// Current unclamped mascot top-left while dragging.
+    pub fn drag_pos(&self) -> Option<(i32, i32)> {
         match self {
-            Drag::Dragging {
-                grab,
-                applied,
-                latest,
-            } => {
-                let dx = (latest.0 - grab.0).round() as i32;
-                let dy = (latest.1 - grab.1).round() as i32;
-                applied.0 += dx;
-                applied.1 += dy;
-                *latest = *grab;
-                Some(*applied)
-            }
+            Drag::Dragging { pos, .. } => Some(*pos),
             _ => None,
         }
     }
@@ -124,9 +128,9 @@ mod tests {
     fn small_motion_is_a_click() {
         let mut drag = Drag::Idle;
         drag.press((10.0, 10.0), (100, 200));
-        assert!(!drag.motion((12.0, 12.0))); // sqrt(8) < 4
-        assert!(!drag.motion((13.0, 12.5))); // sqrt(15.25) < 4
-        assert_eq!(drag.take_pending(), None);
+        assert!(!drag.threshold_crossed((12.0, 12.0))); // sqrt(8) < 4
+        assert!(!drag.threshold_crossed((13.0, 12.5))); // sqrt(15.25) < 4
+        assert_eq!(drag.drag_pos(), None);
         assert_eq!(drag.release(), Release::Click);
         assert_eq!(drag, Drag::Idle);
     }
@@ -135,68 +139,74 @@ mod tests {
     fn exact_threshold_is_still_a_click() {
         let mut drag = Drag::Idle;
         drag.press((0.0, 0.0), (0, 0));
-        assert!(!drag.motion((4.0, 0.0))); // 16 == 16, not past
+        assert!(!drag.threshold_crossed((4.0, 0.0))); // 16 == 16, not past
         assert_eq!(drag.release(), Release::Click);
     }
 
     #[test]
-    fn threshold_crossing_reports_drag_start_once() {
+    fn threshold_crossing_reports_once_then_switches_to_dragging() {
         let mut drag = Drag::Idle;
         drag.press((10.0, 10.0), (100, 200));
-        assert!(drag.motion((15.0, 10.0)));
-        assert!(!drag.motion((20.0, 10.0)));
+        assert!(drag.threshold_crossed((15.0, 10.0)));
         assert!(drag.dragging());
+        // Already dragging: pre-drag motion no longer fires.
+        assert!(!drag.threshold_crossed((99.0, 99.0)));
     }
 
     #[test]
-    fn motions_between_callbacks_coalesce_to_one_net_delta() {
+    fn drag_is_absolute_offset_from_a_lazily_captured_grab() {
         let mut drag = Drag::Idle;
         drag.press((10.0, 10.0), (100, 200));
-        drag.motion((15.0, 10.0));
-        drag.motion((20.0, 14.0));
-        drag.motion((25.0, 12.0)); // net delta from grab: (+15, +2)
-        assert_eq!(drag.take_pending(), Some((115, 202)));
-        // No motion since: the stash was rebased, the delta must be zero —
-        // this is the double-count regression guard.
-        assert_eq!(drag.take_pending(), Some((115, 202)));
-        assert_eq!(drag.take_pending(), Some((115, 202)));
+        drag.threshold_crossed((15.0, 10.0)); // start_pos = (100,200)
+        // First full-output motion captures the grab; sprite does not jump.
+        assert_eq!(drag.drag_to((500.0, 400.0)), Some((100, 200)));
+        // Thereafter, pos = start_pos + (pointer - grab), exact 1:1.
+        assert_eq!(drag.drag_to((530.0, 380.0)), Some((130, 180)));
+        assert_eq!(drag.drag_to((500.0, 400.0)), Some((100, 200)));
+        // A stationary pointer holds position exactly — no drift, no snap.
+        assert_eq!(drag.drag_to((500.0, 400.0)), Some((100, 200)));
+        assert_eq!(drag.drag_to((500.0, 400.0)), Some((100, 200)));
     }
 
     #[test]
-    fn post_apply_motions_measure_from_the_new_position() {
+    fn no_feedback_loop_repeated_same_pointer_is_stable() {
+        // The old accumulated-delta bug: identical coords must NOT drift.
         let mut drag = Drag::Idle;
-        drag.press((10.0, 10.0), (100, 200));
-        drag.motion((30.0, 10.0));
-        assert_eq!(drag.take_pending(), Some((120, 200)));
-        // Surface moved +20 under a pointer that kept moving right: the
-        // compositor now reports coordinates in the moved surface's space.
-        drag.motion((15.0, 10.0)); // 5 right of grab in the new space
-        assert_eq!(drag.take_pending(), Some((125, 200)));
-        // Stationary pointer reads back exactly the grab point: no drift.
-        drag.motion((10.0, 10.0));
-        assert_eq!(drag.take_pending(), Some((125, 200)));
+        drag.press((0.0, 0.0), (1000, 500));
+        drag.threshold_crossed((0.0, 6.0));
+        drag.drag_to((2000.0, 1000.0)); // grab here
+        for _ in 0..100 {
+            assert_eq!(drag.drag_to((2010.0, 1005.0)), Some((1010, 505)));
+        }
     }
 
     #[test]
-    fn fractional_deltas_round_per_apply() {
+    fn fractional_pointer_rounds_per_report_without_accumulating() {
         let mut drag = Drag::Idle;
         drag.press((0.0, 0.0), (0, 0));
-        drag.motion((10.0, 0.0));
-        drag.motion((3.6, 0.4)); // stash overwrite: net (+3.6, +0.4)
-        assert_eq!(drag.take_pending(), Some((4, 0)));
-        // Compositor reports the sub-pixel residue after the move.
-        drag.motion((-0.4, 0.4));
-        assert_eq!(drag.take_pending(), Some((4, 0)));
+        drag.threshold_crossed((5.0, 0.0));
+        drag.drag_to((100.0, 100.0)); // grab
+        assert_eq!(drag.drag_to((103.6, 100.4)), Some((4, 0)));
+        assert_eq!(drag.drag_to((100.4, 100.6)), Some((0, 1)));
+        assert_eq!(drag.drag_to((100.0, 100.0)), Some((0, 0)));
+    }
+
+    #[test]
+    fn drag_to_before_threshold_is_none() {
+        let mut drag = Drag::Idle;
+        assert_eq!(drag.drag_to((50.0, 50.0)), None);
+        drag.press((0.0, 0.0), (10, 10));
+        assert_eq!(drag.drag_to((50.0, 50.0)), None); // still Pressed
     }
 
     #[test]
     fn release_semantics() {
         let mut drag = Drag::Idle;
-        assert!(!drag.motion((50.0, 50.0)));
         assert_eq!(drag.release(), Release::None);
         drag.press((0.0, 0.0), (10, 10));
-        drag.motion((9.0, 0.0));
+        drag.threshold_crossed((0.0, 9.0));
         assert_eq!(drag.release(), Release::Dropped);
-        assert_eq!(drag.take_pending(), None);
+        assert_eq!(drag.drag_pos(), None);
+        assert_eq!(drag, Drag::Idle);
     }
 }

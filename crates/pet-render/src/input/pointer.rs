@@ -16,6 +16,7 @@ use tracing::{debug, info};
 use crate::app::App;
 use crate::input::drag::Release;
 use crate::input::router::{cursor_for, hit_test, Cursor};
+use crate::surface::mascot::SurfaceMode;
 
 const BTN_LEFT: u32 = 0x110;
 const BTN_RIGHT: u32 = 0x111;
@@ -95,13 +96,21 @@ impl PointerHandler for App {
                     self.cursor = Cursor::Default;
                 }
                 PointerEventKind::Motion { .. } => {
-                    // Motions only stash; margins move on the frame-callback
-                    // cadence (see App::drag_apply_step) so each delta is
-                    // measured against a position the compositor has applied.
-                    if self.drag.motion(event.position) {
-                        self.drag_apply_step();
+                    if self.mascot.mode == SurfaceMode::Drag {
+                        // Stationary full-output surface: coords are output
+                        // coords. Feed them straight to the absolute-offset
+                        // drag (only once the resize has been acked, so we
+                        // never mix the docked and full-output spaces).
+                        if !self.mascot.resizing {
+                            self.on_drag_motion(event.position);
+                            self.set_cursor(Cursor::Grabbing);
+                        }
+                    } else if self.drag.threshold_crossed(event.position) {
+                        // Docked surface: cross the click-vs-drag threshold ->
+                        // expand to the full-output drag surface.
+                        self.begin_drag();
                         self.set_cursor(Cursor::Grabbing);
-                    } else if !self.drag.dragging() {
+                    } else {
                         self.set_cursor(cursor_for(false, hit));
                     }
                 }
@@ -129,7 +138,8 @@ impl PointerHandler for App {
                             }
                         }
                     }
-                    let final_position = self.drag.take_pending();
+                    // Capture the final drag position before release clears it.
+                    let final_position = self.drag.drag_pos();
                     match self.drag.release() {
                         Release::Dropped => self.drag_drop(final_position),
                         // Sprite click-without-drag: nothing (tray later).

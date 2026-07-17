@@ -41,7 +41,7 @@ use crate::sprite::semantics;
 use crate::sprite::sheet::Sheet;
 use crate::sprite::timeline::Timeline;
 use crate::surface::bubble::AlertBubble;
-use crate::surface::mascot::{Mascot, EDGE_MARGIN};
+use crate::surface::mascot::{Mascot, SurfaceMode, EDGE_MARGIN};
 use crate::surface::position::Position;
 use crate::surface::visibility::Visibility;
 use crate::text::TextRenderer;
@@ -67,6 +67,11 @@ pub struct App {
     pub position_path: PathBuf,
     pub drag: Drag,
     pub clicks: Clicks,
+    /// A drag render is scheduled on the next compositor frame callback
+    /// (throttles the large full-output buffer to the refresh rate).
+    pub drag_frame_pending: bool,
+    /// The drag position changed since the last drag render.
+    pub drag_dirty: bool,
     pub pointer: Option<WlPointer>,
     /// cursor-shape-v1: absent when the compositor lacks the global —
     /// degrade to no cursor changes. TODO(render-v1): wayland-cursor theme
@@ -158,6 +163,8 @@ pub fn run(
         position_path,
         drag: Drag::Idle,
         clicks: Clicks::default(),
+        drag_frame_pending: false,
+        drag_dirty: false,
         pointer: None,
         cursor_shapes: bound.cursor_shapes,
         shape_device: None,
@@ -348,21 +355,40 @@ impl App {
     }
 
     pub(crate) fn render_frame(&mut self) {
-        if !self.mascot.configured || !self.mascot.visibility.shown() {
+        if !self.mascot.configured || !self.mascot.visibility.shown() || self.mascot.resizing {
             return;
         }
         let now = self.now_ms();
         self.timeline.advance(now);
 
-        if self.alert.visible().is_some() && self.text.is_none() {
+        let dragging = self.mascot.mode == SurfaceMode::Drag;
+        if !dragging && self.alert.visible().is_some() && self.text.is_none() {
             self.text = Some(TextRenderer::new());
         }
 
+        let (surf_w, surf_h) = self.mascot.surface_size();
+        // In Drag mode the sprite sits at the (clamped) drag position within
+        // the stationary full-output surface; in Docked mode it is the
+        // layout-quadrant offset.
+        let (mascot_x, mascot_y) = if dragging {
+            let (dw, dh) = self.mascot.drag_dims;
+            let pos = self
+                .drag
+                .drag_pos()
+                .unwrap_or((self.position.margin_x, self.position.margin_y));
+            (
+                pos.0.clamp(0, (dw as i32 - self.mascot.mascot_w as i32).max(0)) as u32,
+                pos.1.clamp(0, (dh as i32 - self.mascot.mascot_h as i32).max(0)) as u32,
+            )
+        } else {
+            (self.mascot.mascot_x, self.mascot.mascot_y)
+        };
+
         let geo = Geometry {
-            surf_w: self.mascot.surf_w,
-            surf_h: self.mascot.surf_h,
-            mascot_x: self.mascot.mascot_x,
-            mascot_y: self.mascot.mascot_y,
+            surf_w,
+            surf_h,
+            mascot_x,
+            mascot_y,
             mascot_w: self.mascot.mascot_w,
             bubble_above: self.mascot.bubble_above,
             anchor_right: self.mascot.anchor_right,
@@ -373,7 +399,13 @@ impl App {
         let oscale = geo.oscale as i32;
         let sheet = &mut self.sheet;
         let timeline = &self.timeline;
-        let bubble = self.alert.visible().zip(self.text.as_mut());
+        // No bubble while dragging (repositioning, not reading); it returns
+        // on drop when the docked surface is restored.
+        let bubble = if dragging {
+            None
+        } else {
+            self.alert.visible().zip(self.text.as_mut())
+        };
         let result = buffers::present(
             &mut self.pool,
             self.mascot.layer.wl_surface(),
@@ -381,25 +413,30 @@ impl App {
             buf_h,
             |buf| compose::scene(buf, &geo, sheet, timeline, bubble, now),
         );
-        match result {
-            Ok(bubble_px) => {
-                // Keep the input region in step with the bubble box so the
-                // text box is clickable exactly while it is visible.
-                let rect = bubble_px.map(|(x, y, w, h)| Rect {
-                    x: x / oscale,
-                    y: y / oscale,
-                    w: w / oscale as u32,
-                    h: h / oscale as u32,
-                });
-                if rect != self.mascot.bubble_rect {
-                    self.mascot.bubble_rect = rect;
-                    if let Err(e) = self.mascot.update_input_region(&self.compositor_state) {
-                        warn!("input region update failed: {e:#}");
-                    }
-                    self.mascot.layer.commit();
-                }
+        let bubble_px = match result {
+            Ok(px) => px,
+            Err(e) => {
+                self.error = Some(e.context("present frame"));
+                return;
             }
-            Err(e) => self.error = Some(e.context("present frame")),
+        };
+        // The drag surface's input region is the whole output (set once on
+        // enter_drag); only the docked bubble box tracks per-frame.
+        if dragging {
+            return;
+        }
+        let rect = bubble_px.map(|(x, y, w, h)| Rect {
+            x: x / oscale,
+            y: y / oscale,
+            w: w / oscale as u32,
+            h: h / oscale as u32,
+        });
+        if rect != self.mascot.bubble_rect {
+            self.mascot.bubble_rect = rect;
+            if let Err(e) = self.mascot.update_input_region(&self.compositor_state) {
+                warn!("input region update failed: {e:#}");
+            }
+            self.mascot.layer.commit();
         }
     }
 
@@ -491,13 +528,15 @@ impl App {
     }
 
     /// Recompute quadrant layout, margins, and input region from `position`.
-    /// Frozen during a drag (quadrant flips would shift grab coordinates).
+    /// A no-op while the surface is in Drag mode (the full-output surface owns
+    /// its own anchors/margins/region).
     pub(crate) fn sync_layout(&mut self) {
-        if !self.drag.dragging() {
-            self.mascot.relayout(&self.position);
-            if let Err(e) = self.mascot.update_input_region(&self.compositor_state) {
-                warn!("input region update failed: {e:#}");
-            }
+        if self.mascot.mode == SurfaceMode::Drag {
+            return;
+        }
+        self.mascot.relayout(&self.position);
+        if let Err(e) = self.mascot.update_input_region(&self.compositor_state) {
+            warn!("input region update failed: {e:#}");
         }
         self.mascot.apply_margins(&self.position);
         if self.mascot.configured {
@@ -505,44 +544,76 @@ impl App {
         }
     }
 
-    /// One step of the drag apply loop: consume the coalesced pointer delta
-    /// (measured against the last applied position), commit the new margins,
-    /// and ride the surface's frame-callback cadence for the next step —
-    /// per-motion margin writes double-count movement the compositor has
-    /// not applied yet, drifting away from the pointer.
-    pub(crate) fn drag_apply_step(&mut self) {
-        if !self.drag.dragging() {
-            return; // released between callbacks: let the chain die
+    /// Threshold crossed: expand to the stationary full-output surface. The
+    /// sprite holds its docked position until that surface configures and the
+    /// first full-output motion establishes the grab — no jump, no feedback.
+    pub(crate) fn begin_drag(&mut self) {
+        self.drag_frame_pending = false;
+        self.drag_dirty = false;
+        if let Err(e) = self.mascot.enter_drag(&self.compositor_state) {
+            warn!("enter drag surface failed: {e:#}");
+            self.drag.release();
         }
-        if let Some((x, y)) = self.drag.take_pending() {
+    }
+
+    /// A drag motion in full-output (== output) coords. Records the target
+    /// and schedules a frame-rate-limited render.
+    pub(crate) fn on_drag_motion(&mut self, pointer: (f64, f64)) {
+        if self.drag.drag_to(pointer).is_some() {
+            if self.drag_frame_pending {
+                self.drag_dirty = true;
+            } else {
+                self.drag_render();
+            }
+        }
+    }
+
+    /// Render one drag frame and arm a frame callback for the next, so the
+    /// large full-output buffer commits at most once per compositor frame.
+    fn drag_render(&mut self) {
+        if let Some((x, y)) = self.drag.drag_pos() {
             debug!(x, y, "drag apply");
-            self.position.margin_x = x;
-            self.position.margin_y = y;
-            self.mascot.apply_margins(&self.position);
         }
         let surface = self.mascot.layer.wl_surface();
         surface.frame(&self.qh, surface.clone());
-        self.mascot.layer.commit();
+        self.drag_frame_pending = true;
+        self.drag_dirty = false;
+        self.render_frame();
     }
 
-    /// Drag finished: apply the final coalesced delta, clamp on-screen,
-    /// unfreeze the layout, persist.
+    /// Compositor frame callback during a drag: render the latest position if
+    /// it moved, which re-arms only while motion continues.
+    pub(crate) fn on_frame_callback(&mut self) {
+        if !self.drag_frame_pending {
+            return;
+        }
+        self.drag_frame_pending = false;
+        if self.drag.dragging() && self.drag_dirty {
+            self.drag_render();
+        }
+    }
+
+    /// Drag finished: take the final on-screen position, clamp it on-screen,
+    /// shrink back to the docked surface, persist. Rendering (with the bubble
+    /// restored) resumes on the docked configure.
     pub(crate) fn drag_drop(&mut self, final_position: Option<(i32, i32)>) {
+        let (dw, dh) = self.mascot.drag_dims;
         if let Some((x, y)) = final_position {
             self.position.margin_x = x;
             self.position.margin_y = y;
         }
-        if let Some((out_w, out_h)) = self.output_logical() {
-            self.position.clamp(
-                out_w,
-                out_h,
-                self.mascot.mascot_w as i32,
-                self.mascot.mascot_h as i32,
-            );
-        }
+        self.position.clamp(
+            dw as i32,
+            dh as i32,
+            self.mascot.mascot_w as i32,
+            self.mascot.mascot_h as i32,
+        );
         self.position.output_name = self.output_name();
-        self.sync_layout();
-        self.render_frame(); // quadrant may have flipped: sprite offset moved
+        self.drag_frame_pending = false;
+        self.drag_dirty = false;
+        if let Err(e) = self.mascot.exit_drag(&self.compositor_state, &self.position) {
+            warn!("exit drag surface failed: {e:#}");
+        }
         self.position.save(&self.position_path);
         info!(x = self.position.margin_x, y = self.position.margin_y, "position saved");
     }
