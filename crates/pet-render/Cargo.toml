@@ -1,0 +1,19 @@
+[package]
+name = "pet-render"
+description = "Wayland layer-shell renderer for agent-pet"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+pet-proto.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tokio = { workspace = true, features = ["sync"] }
+smithay-client-toolkit.workspace = true
+image.workspace = true
+cosmic-text.workspace = true

@@ -1,0 +1,29 @@
+[package]
+name = "pet-daemon"
+description = "agent-petd: the agent-pet aggregation daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "agent-petd"
+path = "src/main.rs"
+
+[dependencies]
+pet-proto.workspace = true
+pet-core.workspace = true
+pet-adapters.workspace = true
+pet-render.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+toml.workspace = true
+tokio = { workspace = true, features = [
+    "rt-multi-thread", "macros", "signal", "sync", "time", "process", "fs",
+] }
+zbus.workspace = true
+libc.workspace = true

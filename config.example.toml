@@ -1,0 +1,18 @@
+# ~/.config/agent-pet/config.toml — everything optional.
+
+[expiry]
+# How long each state persists before decaying (suffix: s/m/h/d, or raw ms).
+#running = "3m"
+#waiting = "24h"
+#ready   = "7d"
+#failed  = "1h"
+#idle_gc = "10m"
+
+[adapters.gastown]
+# Default: enabled automatically when town_dir exists.
+# Tracks the mayor (alerts when down), crew workers, and overseer
+# escalations. Ephemeral polecats are excluded unless opted in.
+#enabled = true
+#poll_secs = 15
+#town_dir = "/home/you/agent-town/town"
+#include_polecats = false

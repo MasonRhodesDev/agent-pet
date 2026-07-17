@@ -1,0 +1,15 @@
+[package]
+name = "pet-core"
+description = "Pure aggregation state machine for agent-pet (no I/O)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+pet-proto.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

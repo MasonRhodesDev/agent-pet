@@ -1,0 +1,553 @@
+//! One renderer attempt: connect, build the mascot surface, then run a
+//! calloop loop until the daemon shuts down (Ok) or something breaks (Err —
+//! the supervisor in lib.rs recreates everything with backoff).
+
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use anyhow::{anyhow, Context as _, Result};
+use pet_proto::{AgentState, Snapshot, UiAction};
+use smithay_client_toolkit::compositor::CompositorState;
+use smithay_client_toolkit::output::OutputState;
+use smithay_client_toolkit::reexports::calloop::channel;
+use smithay_client_toolkit::reexports::calloop::timer::{TimeoutAction, Timer};
+use smithay_client_toolkit::reexports::calloop::{EventLoop, LoopHandle, RegistrationToken};
+use smithay_client_toolkit::reexports::calloop_wayland_source::WaylandSource;
+use smithay_client_toolkit::reexports::client::globals::registry_queue_init;
+use smithay_client_toolkit::reexports::client::protocol::wl_pointer::WlPointer;
+use smithay_client_toolkit::reexports::client::{Connection, Proxy, QueueHandle};
+use smithay_client_toolkit::reexports::protocols::wp::cursor_shape::v1::client::wp_cursor_shape_device_v1::{
+    Shape, WpCursorShapeDeviceV1,
+};
+use smithay_client_toolkit::registry::RegistryState;
+use smithay_client_toolkit::seat::pointer::cursor_shape::CursorShapeManager;
+use smithay_client_toolkit::seat::pointer::PointerData;
+use smithay_client_toolkit::seat::SeatState;
+use smithay_client_toolkit::shell::WaylandSurface;
+use smithay_client_toolkit::shm::slot::SlotPool;
+use smithay_client_toolkit::shm::Shm;
+use tokio::sync::{mpsc, watch};
+use tracing::{debug, info, warn};
+
+use crate::compose::{self, Geometry};
+use crate::compositor;
+use crate::input::drag::Drag;
+use crate::input::router::{Clicks, Cursor, Rect};
+use crate::sprite::pet_json::{resolve_pet_dir, PetDef};
+use crate::sprite::semantics;
+use crate::sprite::sheet::Sheet;
+use crate::sprite::timeline::Timeline;
+use crate::surface::bubble::AlertBubble;
+use crate::surface::mascot::{Mascot, EDGE_MARGIN};
+use crate::surface::position::Position;
+use crate::surface::visibility::Visibility;
+use crate::text::TextRenderer;
+use crate::wayland::{buffers, globals};
+use crate::{Control, ControlCmd};
+
+pub struct App {
+    pub registry_state: RegistryState,
+    pub output_state: OutputState,
+    pub seat_state: SeatState,
+    pub compositor_state: CompositorState,
+    pub shm: Shm,
+    pub pool: SlotPool,
+    pub mascot: Mascot,
+    pub pet: PetDef,
+    pub sheet: Sheet,
+    pub timeline: Timeline,
+    pub alert: AlertBubble,
+    /// Lazy: font enumeration only happens once a bubble is needed.
+    pub text: Option<TextRenderer>,
+    pub position: Position,
+    pub position_initialized: bool,
+    pub position_path: PathBuf,
+    pub drag: Drag,
+    pub clicks: Clicks,
+    pub pointer: Option<WlPointer>,
+    /// cursor-shape-v1: absent when the compositor lacks the global —
+    /// degrade to no cursor changes. TODO(render-v1): wayland-cursor theme
+    /// fallback for compositors without cursor-shape.
+    pub cursor_shapes: Option<CursorShapeManager>,
+    pub shape_device: Option<WpCursorShapeDeviceV1>,
+    pub cursor: Cursor,
+    pub qh: QueueHandle<App>,
+    /// Render-thread clock epoch; the timeline runs in ms since this.
+    pub started: Instant,
+    pub last_state: AgentState,
+    pub timer_token: Option<RegistrationToken>,
+    pub loop_handle: LoopHandle<'static, App>,
+    pub ui_tx: mpsc::UnboundedSender<UiAction>,
+    pub last_control_seq: u64,
+    pub shutdown: bool,
+    pub error: Option<anyhow::Error>,
+}
+
+pub fn run(
+    snapshot_rx: watch::Receiver<Arc<Snapshot>>,
+    control_rx: watch::Receiver<Control>,
+    ui_tx: mpsc::UnboundedSender<UiAction>,
+) -> Result<()> {
+    let pet_dir = resolve_pet_dir()?;
+    let pet = PetDef::load(&pet_dir)?;
+    let sheet = Sheet::load(&pet)?;
+    info!(pet = %pet.id, dir = %pet_dir.display(), backend = ?compositor::detect(), "pet loaded");
+
+    let position_path = Position::state_path();
+    let saved = Position::load(&position_path);
+    let position_initialized = saved.is_some();
+    let position = saved.unwrap_or(Position {
+        output_name: None,
+        margin_x: 0,
+        margin_y: 0,
+        visible: true,
+    });
+
+    let conn = Connection::connect_to_env().context("connect to wayland display")?;
+    let (globals_list, event_queue) = registry_queue_init::<App>(&conn).context("init registry")?;
+    let qh = event_queue.handle();
+    let bound = globals::bind(&globals_list, &qh)?;
+
+    let sprite_scale = compose::sprite_scale_for(pet.frame_height);
+    let mascot = Mascot::create(
+        &bound.compositor,
+        &bound.layer_shell,
+        &qh,
+        pet.frame_width * sprite_scale,
+        pet.frame_height * sprite_scale,
+        sprite_scale,
+        position.visible,
+    )?;
+    let pool = SlotPool::new(
+        (mascot.surf_w * mascot.surf_h * 4 * 2) as usize,
+        &bound.shm,
+    )
+    .context("create shm pool")?;
+
+    let mut event_loop = EventLoop::<'static, App>::try_new().context("create event loop")?;
+    let handle = event_loop.handle();
+
+    let started = Instant::now();
+    let mut app = App {
+        registry_state: bound.registry_state,
+        output_state: bound.output_state,
+        seat_state: bound.seat_state,
+        compositor_state: bound.compositor,
+        shm: bound.shm,
+        pool,
+        mascot,
+        timeline: Timeline::new(&pet, 0),
+        pet,
+        sheet,
+        alert: AlertBubble::default(),
+        text: None,
+        position,
+        position_initialized,
+        position_path,
+        drag: Drag::Idle,
+        clicks: Clicks::default(),
+        pointer: None,
+        cursor_shapes: bound.cursor_shapes,
+        shape_device: None,
+        cursor: Cursor::Default,
+        qh: qh.clone(),
+        started,
+        last_state: AgentState::Idle,
+        timer_token: None,
+        loop_handle: handle.clone(),
+        ui_tx,
+        last_control_seq: control_rx.borrow().seq,
+        shutdown: false,
+        error: None,
+    };
+    app.apply_snapshot(&snapshot_rx.borrow().clone());
+
+    WaylandSource::new(conn, event_queue)
+        .insert(handle.clone())
+        .map_err(|e| anyhow!("insert wayland source: {e}"))?;
+
+    let (snap_tx, snapshots) = channel::channel::<Arc<Snapshot>>();
+    spawn_bridge("pet-render-bridge", snapshot_rx, snap_tx)?;
+    handle
+        .insert_source(snapshots, |event, _, app: &mut App| match event {
+            channel::Event::Msg(snapshot) => {
+                if app.apply_snapshot(&snapshot) && app.mascot.visibility.shown() {
+                    app.render_frame();
+                    app.rearm_timer();
+                }
+            }
+            channel::Event::Closed => app.shutdown = true,
+        })
+        .map_err(|e| anyhow!("insert snapshot channel: {e}"))?;
+
+    let (ctrl_tx, controls) = channel::channel::<Control>();
+    spawn_bridge("pet-render-ctrl", control_rx, ctrl_tx)?;
+    handle
+        .insert_source(controls, |event, _, app: &mut App| match event {
+            channel::Event::Msg(control) => app.apply_control(control),
+            channel::Event::Closed => app.shutdown = true,
+        })
+        .map_err(|e| anyhow!("insert control channel: {e}"))?;
+
+    app.ensure_timer();
+
+    loop {
+        event_loop
+            .dispatch(None::<Duration>, &mut app)
+            .context("event loop dispatch")?;
+        if let Some(error) = app.error.take() {
+            return Err(error);
+        }
+        if app.shutdown {
+            info!("daemon channels closed; renderer exiting");
+            return Ok(());
+        }
+    }
+}
+
+/// The one frame timer: draw whatever is due, then sleep to the earliest
+/// deadline (sprite frame or typewriter character). Parks itself while the
+/// mascot is hidden; `ensure_timer` restarts it.
+fn timer_tick(_: Instant, _: &mut (), app: &mut App) -> TimeoutAction {
+    if !app.mascot.visibility.shown() {
+        app.timer_token = None;
+        return TimeoutAction::Drop;
+    }
+    app.render_frame();
+    TimeoutAction::ToInstant(app.next_wakeup())
+}
+
+/// Forwards watch updates into a calloop channel. Exits when either side
+/// goes away; dropping the sender tells the render loop to shut down.
+fn spawn_bridge<T: Clone + Send + Sync + 'static>(
+    name: &str,
+    mut rx: watch::Receiver<T>,
+    tx: channel::Sender<T>,
+) -> Result<()> {
+    std::thread::Builder::new()
+        .name(name.into())
+        .spawn(move || loop {
+            if block_on(rx.changed()).is_err() {
+                return; // daemon dropped the watch sender
+            }
+            let value = rx.borrow_and_update().clone();
+            if tx.send(value).is_err() {
+                return; // render loop went away
+            }
+        })
+        .with_context(|| format!("spawn {name}"))?;
+    Ok(())
+}
+
+impl App {
+    fn now_ms(&self) -> u64 {
+        self.started.elapsed().as_millis() as u64
+    }
+
+    /// Returns true if anything visible changed (animation track or bubble).
+    fn apply_snapshot(&mut self, snapshot: &Snapshot) -> bool {
+        let mut changed = false;
+        if snapshot.top != self.last_state {
+            debug!(from = ?self.last_state, to = ?snapshot.top, "mascot state change");
+            self.last_state = snapshot.top;
+            let track = semantics::track_for(snapshot.top, &self.pet);
+            self.timeline.request_state(track, self.now_ms());
+            changed = true;
+        }
+        // Reveal progress is keyed on content identity inside AlertBubble:
+        // heartbeats, track switches, and transient clears never re-type.
+        changed |= self.alert.apply(snapshot, self.now_ms());
+        changed
+    }
+
+    fn apply_control(&mut self, control: Control) {
+        if control.seq == self.last_control_seq {
+            return; // stale replay (e.g. renderer restart)
+        }
+        self.last_control_seq = control.seq;
+        match control.cmd {
+            Some(ControlCmd::Show) => self.show(),
+            Some(ControlCmd::Hide) => self.hide(),
+            None => {}
+        }
+    }
+
+    pub(crate) fn render_frame(&mut self) {
+        if !self.mascot.configured || !self.mascot.visibility.shown() {
+            return;
+        }
+        let now = self.now_ms();
+        self.timeline.advance(now);
+
+        if self.alert.visible().is_some() && self.text.is_none() {
+            self.text = Some(TextRenderer::new());
+        }
+
+        let geo = Geometry {
+            surf_w: self.mascot.surf_w,
+            surf_h: self.mascot.surf_h,
+            mascot_x: self.mascot.mascot_x,
+            mascot_y: self.mascot.mascot_y,
+            mascot_w: self.mascot.mascot_w,
+            bubble_above: self.mascot.bubble_above,
+            anchor_right: self.mascot.anchor_right,
+            sprite_scale: self.mascot.sprite_scale,
+            oscale: self.mascot.output_scale.max(1) as u32,
+        };
+        let (buf_w, buf_h) = geo.buf_size();
+        let oscale = geo.oscale as i32;
+        let sheet = &mut self.sheet;
+        let timeline = &self.timeline;
+        let bubble = self.alert.visible().zip(self.text.as_mut());
+        let result = buffers::present(
+            &mut self.pool,
+            self.mascot.layer.wl_surface(),
+            buf_w,
+            buf_h,
+            |buf| compose::scene(buf, &geo, sheet, timeline, bubble, now),
+        );
+        match result {
+            Ok(bubble_px) => {
+                // Keep the input region in step with the bubble box so the
+                // text box is clickable exactly while it is visible.
+                let rect = bubble_px.map(|(x, y, w, h)| Rect {
+                    x: x / oscale,
+                    y: y / oscale,
+                    w: w / oscale as u32,
+                    h: h / oscale as u32,
+                });
+                if rect != self.mascot.bubble_rect {
+                    self.mascot.bubble_rect = rect;
+                    if let Err(e) = self.mascot.update_input_region(&self.compositor_state) {
+                        warn!("input region update failed: {e:#}");
+                    }
+                    self.mascot.layer.commit();
+                }
+            }
+            Err(e) => self.error = Some(e.context("present frame")),
+        }
+    }
+
+    fn next_wakeup(&self) -> Instant {
+        if !self.mascot.configured {
+            // Poll gently until the first configure lands.
+            return Instant::now() + Duration::from_millis(200);
+        }
+        let now = self.now_ms();
+        let mut deadline = self.timeline.next_deadline_ms();
+        if let Some(t) = self.alert.visible().and_then(|b| b.typing_deadline_ms(now)) {
+            deadline = deadline.min(t);
+        }
+        let at = self.started + Duration::from_millis(deadline);
+        at.max(Instant::now() + Duration::from_millis(1))
+    }
+
+    /// Start the frame timer if it is not running (post-show / startup).
+    pub(crate) fn ensure_timer(&mut self) {
+        if self.timer_token.is_some() || !self.mascot.visibility.shown() {
+            return;
+        }
+        let handle = self.loop_handle.clone();
+        match handle.insert_source(Timer::from_deadline(self.next_wakeup()), timer_tick) {
+            Ok(token) => self.timer_token = Some(token),
+            Err(e) => self.error = Some(anyhow!("arm frame timer: {e}")),
+        }
+    }
+
+    /// Pull the running timer to a new (possibly earlier) deadline.
+    fn rearm_timer(&mut self) {
+        let handle = self.loop_handle.clone();
+        if let Some(token) = self.timer_token.take() {
+            handle.remove(token);
+        }
+        self.ensure_timer();
+    }
+
+    /// Apply a cursor shape (deduped). No-op without cursor-shape-v1.
+    pub(crate) fn set_cursor(&mut self, cursor: Cursor) {
+        if cursor == self.cursor {
+            return;
+        }
+        self.cursor = cursor;
+        let (Some(device), Some(pointer)) = (&self.shape_device, &self.pointer) else {
+            return;
+        };
+        let Some(serial) = pointer
+            .data::<PointerData>()
+            .and_then(|d| d.latest_enter_serial())
+        else {
+            return;
+        };
+        let shape = match cursor {
+            Cursor::Default => Shape::Default,
+            Cursor::Pointer => Shape::Pointer,
+            Cursor::Grab => Shape::Grab,
+            Cursor::Grabbing => Shape::Grabbing,
+        };
+        device.set_shape(serial, shape);
+    }
+
+    pub(crate) fn set_output_scale(&mut self, factor: i32) {
+        if factor == self.mascot.output_scale || factor < 1 {
+            return;
+        }
+        self.mascot.output_scale = factor;
+        if let Err(e) = self.mascot.layer.set_buffer_scale(factor as u32) {
+            warn!("set_buffer_scale({factor}) unsupported: {e:?}");
+            self.mascot.output_scale = 1;
+            return;
+        }
+        self.render_frame();
+    }
+
+    /// Default bottom-right placement, once we know an output's geometry and
+    /// nothing was persisted.
+    pub(crate) fn ensure_position(&mut self) {
+        if self.position_initialized {
+            return;
+        }
+        let Some((out_w, out_h)) = self.output_logical() else {
+            return;
+        };
+        self.position.margin_x = out_w - self.mascot.mascot_w as i32 - EDGE_MARGIN;
+        self.position.margin_y = out_h - self.mascot.mascot_h as i32 - EDGE_MARGIN;
+        self.position.output_name = self.output_name();
+        self.position_initialized = true;
+    }
+
+    /// Recompute quadrant layout, margins, and input region from `position`.
+    /// Frozen during a drag (quadrant flips would shift grab coordinates).
+    pub(crate) fn sync_layout(&mut self) {
+        if !self.drag.dragging() {
+            self.mascot.relayout(&self.position);
+            if let Err(e) = self.mascot.update_input_region(&self.compositor_state) {
+                warn!("input region update failed: {e:#}");
+            }
+        }
+        self.mascot.apply_margins(&self.position);
+        if self.mascot.configured {
+            self.mascot.layer.commit();
+        }
+    }
+
+    /// One step of the drag apply loop: consume the coalesced pointer delta
+    /// (measured against the last applied position), commit the new margins,
+    /// and ride the surface's frame-callback cadence for the next step —
+    /// per-motion margin writes double-count movement the compositor has
+    /// not applied yet, drifting away from the pointer.
+    pub(crate) fn drag_apply_step(&mut self) {
+        if !self.drag.dragging() {
+            return; // released between callbacks: let the chain die
+        }
+        if let Some((x, y)) = self.drag.take_pending() {
+            debug!(x, y, "drag apply");
+            self.position.margin_x = x;
+            self.position.margin_y = y;
+            self.mascot.apply_margins(&self.position);
+        }
+        let surface = self.mascot.layer.wl_surface();
+        surface.frame(&self.qh, surface.clone());
+        self.mascot.layer.commit();
+    }
+
+    /// Drag finished: apply the final coalesced delta, clamp on-screen,
+    /// unfreeze the layout, persist.
+    pub(crate) fn drag_drop(&mut self, final_position: Option<(i32, i32)>) {
+        if let Some((x, y)) = final_position {
+            self.position.margin_x = x;
+            self.position.margin_y = y;
+        }
+        if let Some((out_w, out_h)) = self.output_logical() {
+            self.position.clamp(
+                out_w,
+                out_h,
+                self.mascot.mascot_w as i32,
+                self.mascot.mascot_h as i32,
+            );
+        }
+        self.position.output_name = self.output_name();
+        self.sync_layout();
+        self.render_frame(); // quadrant may have flipped: sprite offset moved
+        self.position.save(&self.position_path);
+        info!(x = self.position.margin_x, y = self.position.margin_y, "position saved");
+    }
+
+    pub(crate) fn hide(&mut self) {
+        if self.mascot.visibility == Visibility::Hidden {
+            return;
+        }
+        info!("hiding mascot");
+        self.drag.release();
+        self.mascot.unmap();
+        self.position.visible = false;
+        self.position.save(&self.position_path);
+        // The frame timer parks itself on its next tick.
+    }
+
+    pub(crate) fn show(&mut self) {
+        if self.mascot.visibility.shown() {
+            return;
+        }
+        info!("showing mascot");
+        self.position.visible = true;
+        self.position.save(&self.position_path);
+        if self.mascot.configured {
+            // Never unmapped (startup-hidden): the first configure is still
+            // valid, attach straight away.
+            self.mascot.visibility = Visibility::Visible;
+            self.render_frame();
+            self.ensure_timer();
+        } else {
+            self.mascot.request_remap(&self.position);
+        }
+    }
+
+    fn output_logical(&self) -> Option<(i32, i32)> {
+        let info = match &self.mascot.entered {
+            Some(output) => self.output_state.info(output),
+            None => self
+                .output_state
+                .outputs()
+                .next()
+                .and_then(|o| self.output_state.info(&o)),
+        };
+        info.as_ref().and_then(globals::logical_size)
+    }
+
+    fn output_name(&self) -> Option<String> {
+        let info = match &self.mascot.entered {
+            Some(output) => self.output_state.info(output),
+            None => self
+                .output_state
+                .outputs()
+                .next()
+                .and_then(|o| self.output_state.info(&o)),
+        };
+        info.and_then(|i| i.name)
+    }
+}
+
+/// Minimal executor for `watch::Receiver::changed()` — tokio sync primitives
+/// don't need a runtime, only a waker.
+fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+    use std::task::{Context, Poll, Wake, Waker};
+
+    struct ThreadWaker(std::thread::Thread);
+    impl Wake for ThreadWaker {
+        fn wake(self: Arc<Self>) {
+            self.0.unpark();
+        }
+    }
+
+    let waker = Waker::from(Arc::new(ThreadWaker(std::thread::current())));
+    let mut cx = Context::from_waker(&waker);
+    let mut fut = std::pin::pin!(fut);
+    loop {
+        match fut.as_mut().poll(&mut cx) {
+            Poll::Ready(out) => return out,
+            Poll::Pending => std::thread::park(),
+        }
+    }
+}
+

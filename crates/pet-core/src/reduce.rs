@@ -1,0 +1,67 @@
+//! Pure derivation of display state from the model.
+
+use pet_proto::{AgentState, SessionView, Snapshot};
+
+use crate::model::Model;
+
+/// Mascot/tray priority. Higher = more attention-worthy. Seen Ready/Failed
+/// no longer drive the mascot (the user has acknowledged them).
+fn priority(state: AgentState, seen: bool) -> u8 {
+    match (state, seen) {
+        (AgentState::Waiting, _) => 5,
+        (AgentState::Failed, false) => 4,
+        (AgentState::Ready, false) => 3,
+        (AgentState::Running, _) => 2,
+        (AgentState::Failed, true) | (AgentState::Ready, true) => 1,
+        (AgentState::Idle | AgentState::Gone, _) => 0,
+    }
+}
+
+pub fn reduce(model: &Model, now_ms: i64) -> Snapshot {
+    let mut sessions: Vec<SessionView> = model
+        .sessions
+        .iter()
+        .filter(|(_, s)| s.phase != AgentState::Idle)
+        .map(|(key, s)| SessionView {
+            key: key.clone(),
+            state: s.phase,
+            since: s.since,
+            seen: s.seen,
+            via: s.via,
+            body: s.body.clone(),
+            meta: s.meta.clone(),
+        })
+        .collect();
+
+    sessions.sort_by(|a, b| {
+        priority(b.state, b.seen)
+            .cmp(&priority(a.state, a.seen))
+            .then(b.since.cmp(&a.since))
+    });
+
+    let top = sessions
+        .iter()
+        .map(|s| (priority(s.state, s.seen), s.state))
+        .max_by_key(|(p, _)| *p)
+        .filter(|(p, _)| *p >= 2)
+        .map(|(_, state)| state)
+        .unwrap_or(AgentState::Idle);
+
+    let unread = sessions
+        .iter()
+        .filter(|s| !s.seen && matches!(s.state, AgentState::Ready | AgentState::Failed))
+        .count() as u32;
+
+    Snapshot {
+        top,
+        sessions,
+        unread,
+        at: now_ms,
+    }
+}
+
+/// Earliest pending expiry across all sessions; the shell arms its timer to
+/// this instant.
+pub fn next_deadline(model: &Model) -> Option<i64> {
+    model.sessions.values().map(|s| s.deadline).min()
+}

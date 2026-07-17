@@ -1,0 +1,46 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/pet-proto",
+    "crates/pet-core",
+    "crates/pet-adapters",
+    "crates/pet-render",
+    "crates/pet-cli",
+    "crates/pet-daemon",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/MasonRhodesDev/agent-pet"
+authors = ["Mason Rhodes"]
+
+[workspace.dependencies]
+pet-proto = { path = "crates/pet-proto" }
+pet-core = { path = "crates/pet-core" }
+pet-adapters = { path = "crates/pet-adapters" }
+pet-render = { path = "crates/pet-render" }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tokio = { version = "1", default-features = false }
+zbus = { version = "5", default-features = false, features = ["tokio"] }
+toml = "0.8"
+libc = "0.2"
+unicode-segmentation = "1"
+tempfile = "3"
+# Renderer stack: pure Rust, no C deps (rust wayland backend; xkbcommon
+# feature deliberately off — no keyboard input in v0).
+smithay-client-toolkit = { version = "0.20", default-features = false, features = ["calloop"] }
+image = { version = "0.25", default-features = false, features = ["png", "webp"] }
+cosmic-text = "0.14"
+
+[profile.release]
+lto = true
+strip = true
+codegen-units = 1
