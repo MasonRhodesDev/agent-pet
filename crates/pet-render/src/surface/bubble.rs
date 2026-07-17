@@ -248,6 +248,7 @@ mod tests {
             since: 0,
             seen: false,
             via: None,
+            focused: false,
             body: body.map(String::from),
             meta: Meta::default(),
         }

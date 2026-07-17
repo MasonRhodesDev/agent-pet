@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context as _, Result};
-use pet_proto::{AgentState, Snapshot, UiAction};
+use pet_proto::{ActiveWindow, AgentState, Snapshot, UiAction};
 use smithay_client_toolkit::compositor::CompositorState;
 use smithay_client_toolkit::output::OutputState;
 use smithay_client_toolkit::reexports::calloop::channel;
@@ -31,7 +31,9 @@ use tokio::sync::{mpsc, watch};
 use tracing::{debug, info, warn};
 
 use crate::compose::{self, Geometry};
-use crate::compositor;
+use crate::compositor::settle::{Action as SettleAction, Settle, DEFAULT_SETTLE_MS};
+use crate::compositor::wlr_generic::Wlr;
+use crate::compositor::{self, ActiveWindowSource, SourceCtx};
 use crate::input::drag::Drag;
 use crate::input::router::{Clicks, Cursor, Rect};
 use crate::sprite::pet_json::{resolve_pet_dir, PetDef};
@@ -80,6 +82,15 @@ pub struct App {
     pub loop_handle: LoopHandle<'static, App>,
     pub ui_tx: mpsc::UnboundedSender<UiAction>,
     pub last_control_seq: u64,
+    /// Focus-fact debounce; the settled value is sent as
+    /// UiAction::ActiveWindowChanged.
+    pub settle: Settle,
+    pub settle_token: Option<RegistrationToken>,
+    /// wlr foreign-toplevel tracking (inert under Hyprland / when the global
+    /// is absent).
+    pub wlr: Wlr,
+    /// Keeps the active-window source alive for the run's lifetime.
+    pub active_window_source: ActiveWindowSource,
     pub shutdown: bool,
     pub error: Option<anyhow::Error>,
 }
@@ -158,6 +169,10 @@ pub fn run(
         loop_handle: handle.clone(),
         ui_tx,
         last_control_seq: control_rx.borrow().seq,
+        settle: Settle::new(DEFAULT_SETTLE_MS),
+        settle_token: None,
+        wlr: Wlr::default(),
+        active_window_source: ActiveWindowSource::None,
         shutdown: false,
         error: None,
     };
@@ -189,6 +204,27 @@ pub fn run(
             channel::Event::Closed => app.shutdown = true,
         })
         .map_err(|e| anyhow!("insert control channel: {e}"))?;
+
+    // Active-window facts: the backend (Hyprland socket thread or wlr
+    // foreign-toplevel on this connection) pushes raw facts here; the
+    // renderer debounces (settle) before emitting ActiveWindowChanged. This
+    // never blocks the dispatch — the Hyprland reader lives on its own thread.
+    let backend = compositor::backend();
+    info!(backend = backend.name(), "active-window source");
+    let (fact_tx, facts) = channel::channel::<Option<ActiveWindow>>();
+    app.wlr.set_sink(fact_tx.clone());
+    app.active_window_source = backend.start_active_window_source(SourceCtx {
+        globals: &globals_list,
+        qh: &qh,
+        sink: fact_tx,
+    });
+    handle
+        .insert_source(facts, |event, _, app: &mut App| {
+            if let channel::Event::Msg(window) = event {
+                app.on_active_window_fact(window);
+            }
+        })
+        .map_err(|e| anyhow!("insert active-window channel: {e}"))?;
 
     app.ensure_timer();
 
@@ -270,6 +306,44 @@ impl App {
             Some(ControlCmd::Show) => self.show(),
             Some(ControlCmd::Hide) => self.hide(),
             None => {}
+        }
+    }
+
+    /// A raw active-window fact from the compositor backend. Runs it through
+    /// the settle debounce and (re)arms the settle timer.
+    fn on_active_window_fact(&mut self, window: Option<ActiveWindow>) {
+        let action = self.settle.observe(window, Instant::now());
+        self.apply_settle_action(action);
+    }
+
+    /// Settle timer fired: emit if the pending fact is due, else re-arm.
+    fn on_settle_timer(&mut self) {
+        self.settle_token = None;
+        let action = self.settle.on_timer(Instant::now());
+        self.apply_settle_action(action);
+    }
+
+    fn apply_settle_action(&mut self, action: SettleAction) {
+        match action {
+            SettleAction::None => {}
+            SettleAction::ArmTimer(at) => {
+                if let Some(token) = self.settle_token.take() {
+                    self.loop_handle.remove(token);
+                }
+                match self
+                    .loop_handle
+                    .insert_source(Timer::from_deadline(at), |_, _, app: &mut App| {
+                        app.on_settle_timer();
+                        TimeoutAction::Drop
+                    }) {
+                    Ok(token) => self.settle_token = Some(token),
+                    Err(e) => warn!("arm settle timer: {e}"),
+                }
+            }
+            SettleAction::Emit(window) => {
+                debug!(?window, "active window settled");
+                let _ = self.ui_tx.send(UiAction::ActiveWindowChanged { window });
+            }
         }
     }
 

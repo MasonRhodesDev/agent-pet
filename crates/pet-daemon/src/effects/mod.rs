@@ -15,6 +15,9 @@
 mod hyprland;
 mod tmux;
 
+// Reused by the focus-suppression window join.
+pub(crate) use hyprland::{ancestry_chain, read_proc_stat};
+
 use std::path::Path;
 
 use pet_proto::{Meta, SessionKey, Source};
