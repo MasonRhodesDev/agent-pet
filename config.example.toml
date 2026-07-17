@@ -1,5 +1,12 @@
 # ~/.config/agent-pet/config.toml — everything optional.
 
+[pet]
+# Which pet to show. A name resolves to ~/.config/agent-pet/pets/<skin>/
+# (a directory with pet.json + spritesheet); an absolute path also works.
+# Empty / unset = the installed default pet. Restart the daemon to apply:
+#   systemctl --user restart agent-petd
+#skin = "fenny-frank"
+
 [expiry]
 # How long each state persists before decaying (suffix: s/m/h/d, or raw ms).
 #running = "3m"

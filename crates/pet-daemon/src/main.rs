@@ -127,6 +127,17 @@ async fn main() -> anyhow::Result<()> {
         ));
     }
 
+    // Config-driven skin selection: the renderer resolves AGENT_PET_SKIN
+    // (name under ~/.config/agent-pet/pets/, or a path). An externally-set
+    // env var still wins, for dev iteration.
+    if let Some(skin) = config.pet.skin.as_deref() {
+        if std::env::var_os("AGENT_PET_SKIN").is_none() && !skin.is_empty() {
+            // SAFETY: set before the renderer thread is spawned; nothing else
+            // reads the environment concurrently at this point.
+            unsafe { std::env::set_var("AGENT_PET_SKIN", skin) };
+        }
+    }
+
     // The renderer supervises itself (backoff + panic capture); it can never
     // take the daemon down.
     if !headless {

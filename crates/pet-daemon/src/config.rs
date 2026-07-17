@@ -9,7 +9,17 @@ pub struct Config {
     pub ttls: Ttls,
     pub gastown: GastownConfig,
     pub focus: FocusConfig,
+    pub pet: PetConfig,
     pub state_path: PathBuf,
+}
+
+/// Appearance. `skin` names a directory under
+/// `~/.config/agent-pet/pets/<skin>/` (containing pet.json + spritesheet), or
+/// an absolute path to one. Empty = the installed default pet.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct PetConfig {
+    pub skin: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -68,6 +78,7 @@ struct FileConfig {
     expiry: ExpiryConfig,
     adapters: AdaptersConfig,
     focus: FocusConfig,
+    pet: PetConfig,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -118,6 +129,7 @@ impl Config {
             ttls,
             gastown: file.adapters.gastown,
             focus: file.focus,
+            pet: file.pet,
             state_path: state_home().join("agent-pet/state.json"),
         }
     }
