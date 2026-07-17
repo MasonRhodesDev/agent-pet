@@ -1,6 +1,16 @@
-//! Codex-compatible `pet.json` loader. Community Codex pets are drop-in
-//! skins; the grid may be any size that exactly tiles the sheet (Codex itself
-//! ships 1536x1872 sheets of 192x208 frames, 8x9).
+//! Codex/ChatGPT-desktop-compatible `pet.json` loader. Community pets are
+//! drop-in skins.
+//!
+//! The sheet is a grid of 192x208 cells, always 8 columns. `spriteVersionNumber`
+//! (default 1) picks the row count when the manifest omits an explicit `frame`
+//! block: v1 = 9 rows (1536x1872), v2 = 11 rows (1536x2288). Row meanings
+//! (shared 0-8; v2 adds 9-10):
+//!   0 idle | 1 running-right | 2 running-left | 3 waving | 4 jumping |
+//!   5 failed | 6 waiting | 7 running | 8 review | 9,10 gaze frames (v2).
+//! When `animations` is also omitted the whole animation map is synthesized
+//! from that row table with the app's exact frame counts and timings.
+//! Custom pets that DO specify `frame`/`animations` keep the explicit path
+//! (any grid that exactly tiles the sheet).
 
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
@@ -10,7 +20,14 @@ use serde::Deserialize;
 
 pub const MAX_FRAMES: usize = 256;
 pub const MAX_FPS: f64 = 60.0;
-/// Codex's calm idle loop, row 0: used to synthesize `idle` when absent.
+/// Canonical sheet geometry (ChatGPT desktop app).
+pub const CELL_W: u32 = 192;
+pub const CELL_H: u32 = 208;
+pub const CANONICAL_COLS: u32 = 8;
+/// Rows per sprite version.
+pub const V1_ROWS: u32 = 9;
+pub const V2_ROWS: u32 = 11;
+/// The app's bespoke idle loop (row 0): a ~6.6s breathing cycle.
 pub const IDLE_TIMINGS_MS: [u64; 6] = [1680, 660, 660, 840, 840, 1920];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -72,7 +89,18 @@ impl PetDef {
     /// (`validate_sheet` covers those once the image is known).
     pub fn parse(raw: &str, dir: &Path, fallback_id: &str) -> Result<Self> {
         let file: PetFile = serde_json::from_str(raw).context("parse pet.json")?;
-        let frame = file.frame.unwrap_or_default();
+        let version = file.sprite_version.unwrap_or(1);
+        // Explicit `frame` wins (arbitrary custom grids); otherwise derive the
+        // canonical grid from the sprite version.
+        let frame = match file.frame {
+            Some(f) => f,
+            None => FrameSpec {
+                width: CELL_W,
+                height: CELL_H,
+                columns: CANONICAL_COLS,
+                rows: if version == 2 { V2_ROWS } else { V1_ROWS },
+            },
+        };
         if frame.width == 0 || frame.height == 0 || frame.columns == 0 || frame.rows == 0 {
             bail!("pet frame dimensions and grid counts must be non-zero");
         }
@@ -188,6 +216,8 @@ fn home() -> PathBuf {
 struct PetFile {
     #[serde(default)]
     id: Option<String>,
+    #[serde(default, rename = "spriteVersionNumber")]
+    sprite_version: Option<u32>,
     #[serde(default, rename = "spritesheetPath")]
     spritesheet_path: Option<String>,
     frame: Option<FrameSpec>,
@@ -201,18 +231,6 @@ struct FrameSpec {
     height: u32,
     columns: u32,
     rows: u32,
-}
-
-impl Default for FrameSpec {
-    fn default() -> Self {
-        // Codex canonical grid.
-        Self {
-            width: 192,
-            height: 208,
-            columns: 8,
-            rows: 9,
-        }
-    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -240,11 +258,12 @@ fn build_animations(
     grid: &FrameSpec,
     frame_count: usize,
 ) -> Result<HashMap<String, Animation>> {
-    // Seed the semantic state tracks on canonical-shaped grids so pets that
-    // omit `animations` (most community Codex pets) still work; explicit
-    // specs override. Small custom grids get only what they declare + idle.
-    let mut animations = if grid.columns >= 8 && grid.rows >= 9 {
-        default_state_animations(grid.columns as usize)
+    // Seed the code-driven animation map on canonical-shaped grids so pets
+    // that omit `animations` (the ChatGPT desktop pets, most community pets)
+    // work out of the box; explicit specs below override. Small custom grids
+    // get only what they declare + idle.
+    let mut animations = if grid.columns >= CANONICAL_COLS && grid.rows >= V1_ROWS {
+        code_driven_animations(grid.columns as usize)
     } else {
         HashMap::new()
     };
@@ -333,10 +352,16 @@ fn synthesized_idle(columns: usize, frame_count: usize) -> Animation {
     }
 }
 
-/// Codex semantic rows: failed=5, waiting=6, running=7, review=8. Single-pass
-/// tracks — the timeline supplies the play-3x-then-idle behavior.
-fn default_state_animations(columns: usize) -> HashMap<String, Animation> {
-    let row = |row: usize, count: usize, ms: u64, last_ms: u64| Animation {
+/// The ChatGPT desktop app's code-driven animation map (row table with the
+/// app's exact frame counts + timings). Each row is `j(N, normalMs, lastMs)`:
+/// N frames of `normalMs`, last frame held `lastMs`. All single-pass with
+/// `loop_start = 0`; the timeline supplies the play-3x-then-settle burst for
+/// non-idle tracks (equivalent to the app baking `[anim;3, ...idle]`).
+///
+/// Row map: 0 idle | 1 running-right | 2 running-left | 3 waving |
+/// 4 jumping | 5 failed | 6 waiting | 7 running | 8 review.
+fn code_driven_animations(columns: usize) -> HashMap<String, Animation> {
+    let j = |row: usize, count: usize, ms: u64, last_ms: u64| Animation {
         frames: (0..count)
             .map(|col| Frame {
                 sprite_index: row * columns + col,
@@ -347,14 +372,35 @@ fn default_state_animations(columns: usize) -> HashMap<String, Animation> {
         fallback: "idle".to_string(),
     };
     [
-        ("failed", row(5, 8, 140, 240)),
-        ("waiting", row(6, 6, 150, 260)),
-        ("running", row(7, 6, 120, 220)),
-        ("review", row(8, 6, 150, 280)),
+        ("idle", idle_animation()),
+        ("running-right", j(1, 8, 120, 220)),
+        ("running-left", j(2, 8, 120, 220)),
+        ("waving", j(3, 4, 140, 280)),
+        ("jumping", j(4, 5, 140, 280)),
+        ("failed", j(5, 8, 140, 240)),
+        ("waiting", j(6, 6, 150, 260)),
+        ("running", j(7, 6, 120, 220)),
+        ("review", j(8, 6, 150, 280)),
     ]
     .into_iter()
     .map(|(name, anim)| (name.to_string(), anim))
     .collect()
+}
+
+/// The bespoke row-0 idle loop with the app's exact breathing timings.
+fn idle_animation() -> Animation {
+    Animation {
+        frames: IDLE_TIMINGS_MS
+            .iter()
+            .enumerate()
+            .map(|(i, &duration_ms)| Frame {
+                sprite_index: i,
+                duration_ms,
+            })
+            .collect(),
+        loop_start: Some(0),
+        fallback: "idle".to_string(),
+    }
 }
 
 /// The manifest may only reference sheets inside its own directory.
@@ -518,6 +564,73 @@ mod tests {
     fn spritesheet_path_may_not_escape_pet_dir() {
         let err = parse(r#"{"spritesheetPath": "../sheet.png"}"#).unwrap_err();
         assert!(err.to_string().contains("must stay inside"));
+    }
+
+    #[test]
+    fn v1_grid_derived_when_frame_absent() {
+        // No frame, no version -> v1 canonical 8x9.
+        let pet = parse(r#"{"id":"x"}"#).unwrap();
+        assert_eq!((pet.columns, pet.rows), (8, 9));
+        assert_eq!((pet.frame_width, pet.frame_height), (192, 208));
+        assert_eq!(pet.frame_count(), 72);
+        pet.validate_sheet(1536, 1872).unwrap();
+    }
+
+    #[test]
+    fn v2_minimal_manifest_derives_8x11_grid_and_gaze_rows() {
+        let pet = parse(
+            r#"{"id":"fenny-frank","spriteVersionNumber":2,"spritesheetPath":"spritesheet.webp"}"#,
+        )
+        .unwrap();
+        assert_eq!(pet.id, "fenny-frank");
+        assert_eq!((pet.columns, pet.rows), (8, 11));
+        assert_eq!(pet.frame_count(), 88); // rows 9,10 = gaze frames 72..87
+        pet.validate_sheet(1536, 2288).unwrap();
+        // The v2 sheet only exact-tiles at 1536x2288.
+        assert!(pet.validate_sheet(1536, 1872).is_err());
+    }
+
+    #[test]
+    fn code_driven_map_has_all_state_and_gesture_tracks_with_app_timings() {
+        let pet = parse(r#"{"spriteVersionNumber":2}"#).unwrap();
+        for track in [
+            "idle",
+            "running-right",
+            "running-left",
+            "waving",
+            "jumping",
+            "failed",
+            "waiting",
+            "running",
+            "review",
+        ] {
+            assert!(pet.animations.contains_key(track), "missing {track}");
+        }
+        // Exact frame counts + timings from the app's row table.
+        let waving = &pet.animations["waving"];
+        assert_eq!(waving.frames.len(), 4);
+        assert_eq!(waving.frames[0].sprite_index, 24); // row 3 * 8
+        assert_eq!(
+            waving.frames.iter().map(|f| f.duration_ms).collect::<Vec<_>>(),
+            vec![140, 140, 140, 280]
+        );
+        let jumping = &pet.animations["jumping"];
+        assert_eq!(jumping.frames.len(), 5);
+        assert_eq!(jumping.frames[0].sprite_index, 32); // row 4 * 8
+        assert_eq!(jumping.frames[4].duration_ms, 280);
+        let walk_r = &pet.animations["running-right"];
+        assert_eq!(walk_r.frames.len(), 8);
+        assert_eq!(walk_r.frames[0].sprite_index, 8); // row 1 * 8
+        assert_eq!(pet.animations["running-left"].frames[0].sprite_index, 16);
+        // Idle keeps the bespoke breathing timings.
+        assert_eq!(
+            pet.animations["idle"]
+                .frames
+                .iter()
+                .map(|f| f.duration_ms)
+                .collect::<Vec<_>>(),
+            IDLE_TIMINGS_MS.to_vec()
+        );
     }
 
     #[test]
