@@ -67,16 +67,19 @@ pub fn map_hook(
             payload.prompt.as_deref().and_then(hygiene::body),
         ),
         "PostToolUse" => (AgentState::Running, payload.tool_name.clone()),
-        "Notification" => {
-            let body = match payload.message.as_deref() {
-                // A specific permission prompt is already useful: keep it.
-                Some(m) if is_permission_message(m) => hygiene::body(m),
-                // The generic idle nag: replace it with what Claude actually
-                // asked (the transcript tail), falling back to the message.
-                other => tail_body.clone().or_else(|| other.and_then(hygiene::body)),
-            };
-            (AgentState::Waiting, body)
-        }
+        "Notification" => match payload.message.as_deref() {
+            // A real permission/approval prompt genuinely blocks progress →
+            // needs-input (the persistent nag is warranted). Keep its text.
+            Some(m) if is_permission_message(m) => (AgentState::Waiting, hygiene::body(m)),
+            // The generic idle "Claude is waiting for your input" fires ~60s
+            // after any turn ends; nothing is actually blocked, so it is NOT
+            // needs-input — it means "done, look whenever" → ready, showing
+            // what Claude last said.
+            other => (
+                AgentState::Ready,
+                tail_body.clone().or_else(|| other.and_then(hygiene::body)),
+            ),
+        },
         "Stop" => (AgentState::Ready, tail_body.clone()),
         "SessionEnd" => (AgentState::Gone, payload.reason.clone()),
         _ => return Ok(None),
@@ -136,25 +139,31 @@ mod tests {
     }
 
     #[test]
-    fn generic_notification_is_replaced_by_tail() {
+    fn generic_idle_notification_is_ready_not_needs_input() {
+        // The idle "waiting for your input" fires after every turn ends;
+        // nothing is blocked, so it must NOT nag as needs-input.
         let generic = r#"{"hook_event_name":"Notification","session_id":"s","message":"Claude is waiting for your input"}"#;
         let ev = map_hook(generic, None, Some("Should I deploy to staging?".into()))
             .unwrap()
             .unwrap();
-        assert_eq!(ev.state, AgentState::Waiting);
+        assert_eq!(ev.state, AgentState::Ready);
         assert_eq!(ev.body.as_deref(), Some("Should I deploy to staging?"));
 
-        // Without a tail, the generic message is the fallback.
+        // Without a tail, the generic message is the fallback caption.
         let ev = map_hook(generic, None, None).unwrap().unwrap();
+        assert_eq!(ev.state, AgentState::Ready);
         assert_eq!(ev.body.as_deref(), Some("Claude is waiting for your input"));
     }
 
     #[test]
-    fn specific_permission_message_is_kept_over_tail() {
+    fn real_permission_prompt_is_needs_input() {
+        // A genuine approval blocks progress → waiting, keeping its text over
+        // any transcript tail.
         let perm = r#"{"hook_event_name":"Notification","session_id":"s","message":"Claude needs your permission to use Bash"}"#;
         let ev = map_hook(perm, None, Some("some unrelated tail".into()))
             .unwrap()
             .unwrap();
+        assert_eq!(ev.state, AgentState::Waiting);
         assert_eq!(ev.body.as_deref(), Some("Claude needs your permission to use Bash"));
     }
 
