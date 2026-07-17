@@ -35,7 +35,7 @@ use crate::compositor::settle::{Action as SettleAction, Settle, DEFAULT_SETTLE_M
 use crate::compositor::wlr_generic::Wlr;
 use crate::compositor::{self, ActiveWindowSource, SourceCtx};
 use crate::input::drag::{Drag, Walk};
-use crate::input::router::{Clicks, Cursor, Rect};
+use crate::input::router::{self, Clicks, Cursor, HoverChange, Rect};
 use crate::sprite::pet_json::{resolve_pet_dir, PetDef};
 use crate::sprite::semantics;
 use crate::sprite::sheet::Sheet;
@@ -74,6 +74,8 @@ pub struct App {
     pub drag_dirty: bool,
     /// Horizontal-travel tracker: drives the walk animation while dragging.
     pub walk: Option<Walk>,
+    /// True while the pointer hovers the sprite and the jump gesture is up.
+    pub hovering: bool,
     pub pointer: Option<WlPointer>,
     /// cursor-shape-v1: absent when the compositor lacks the global —
     /// degrade to no cursor changes. TODO(render-v1): wayland-cursor theme
@@ -170,6 +172,7 @@ pub fn run(
         drag_frame_pending: false,
         drag_dirty: false,
         walk: None,
+        hovering: false,
         pointer: None,
         cursor_shapes: bound.cursor_shapes,
         shape_device: None,
@@ -373,6 +376,30 @@ impl App {
             self.sheet
                 .any_visible(a.frames.iter().map(|f| f.sprite_index))
         })
+    }
+
+    /// Hover the sprite -> jump once (burst); leave -> back to the base
+    /// state. Pure edge logic in `router::hover_transition`; only touches the
+    /// animation, never the input routing (click/drag/right-click unaffected).
+    pub(crate) fn set_hover(&mut self, over_sprite: bool) {
+        let docked = self.mascot.mode == SurfaceMode::Docked;
+        let change = router::hover_transition(
+            over_sprite,
+            docked,
+            self.drag.dragging(),
+            self.track_has_art("jumping"),
+            &mut self.hovering,
+        );
+        let track = match change {
+            Some(HoverChange::Jump) => "jumping".to_string(),
+            Some(HoverChange::ReturnToBase) => {
+                semantics::track_for(self.last_state, &self.pet).to_string()
+            }
+            None => return,
+        };
+        self.timeline.request_state(&track, self.now_ms());
+        self.render_frame();
+        self.rearm_timer();
     }
 
     /// First-awake greeting: on the reveal edge, wave once (burst 3x ->
@@ -585,6 +612,7 @@ impl App {
     pub(crate) fn begin_drag(&mut self) {
         self.drag_frame_pending = false;
         self.drag_dirty = false;
+        self.hovering = false; // hover-jump is docked-only; clean slate
         // Only walk if the pet has directional walk art (both rows); the
         // default pet's rows 1-2 are blank, so it slides on its base track.
         self.walk = (self.track_has_art("running-right") && self.track_has_art("running-left"))

@@ -15,7 +15,7 @@ use tracing::{debug, info};
 
 use crate::app::App;
 use crate::input::drag::Release;
-use crate::input::router::{cursor_for, hit_test, Cursor};
+use crate::input::router::{cursor_for, hit_test, Cursor, Hit};
 use crate::surface::mascot::SurfaceMode;
 
 const BTN_LEFT: u32 = 0x110;
@@ -82,6 +82,7 @@ impl PointerHandler for App {
             );
             match event.kind {
                 PointerEventKind::Enter { .. } => {
+                    self.set_hover(hit == Hit::Sprite);
                     self.set_cursor(cursor_for(self.drag.dragging(), hit));
                 }
                 PointerEventKind::Leave { .. } => {
@@ -93,6 +94,7 @@ impl PointerHandler for App {
                         self.drag.release();
                     }
                     self.clicks.cancel();
+                    self.set_hover(false);
                     self.cursor = Cursor::Default;
                 }
                 PointerEventKind::Motion { .. } => {
@@ -111,6 +113,8 @@ impl PointerHandler for App {
                         self.begin_drag();
                         self.set_cursor(Cursor::Grabbing);
                     } else {
+                        // Pure hover: jump when entering the sprite region.
+                        self.set_hover(hit == Hit::Sprite);
                         self.set_cursor(cursor_for(false, hit));
                     }
                 }

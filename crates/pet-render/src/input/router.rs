@@ -96,6 +96,38 @@ pub fn cursor_for(dragging: bool, hit: Hit) -> Cursor {
     }
 }
 
+/// Hover-jump edge action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HoverChange {
+    /// Started hovering the sprite: play the jumping gesture.
+    Jump,
+    /// Stopped hovering: return to the base state.
+    ReturnToBase,
+}
+
+/// Edge-detect the hover-jump. A jump-hover is "pointer over the sprite, in
+/// the docked surface, not dragging, and the pet has jump art". `hovering`
+/// carries the current state and is updated in place; returns the transition
+/// action only when it flips.
+pub fn hover_transition(
+    over_sprite: bool,
+    docked: bool,
+    dragging: bool,
+    has_jump_art: bool,
+    hovering: &mut bool,
+) -> Option<HoverChange> {
+    let want = over_sprite && docked && !dragging && has_jump_art;
+    if want == *hovering {
+        return None;
+    }
+    *hovering = want;
+    Some(if want {
+        HoverChange::Jump
+    } else {
+        HoverChange::ReturnToBase
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -158,5 +190,42 @@ mod tests {
         // An active drag overrides whatever is hovered.
         assert_eq!(cursor_for(true, Hit::Sprite), Cursor::Grabbing);
         assert_eq!(cursor_for(true, Hit::Outside), Cursor::Grabbing);
+    }
+
+    #[test]
+    fn hover_jump_edges_only_over_sprite_when_docked_and_idle() {
+        let mut hovering = false;
+        // Enter the sprite (docked, not dragging, has art): jump once.
+        assert_eq!(
+            hover_transition(true, true, false, true, &mut hovering),
+            Some(HoverChange::Jump)
+        );
+        assert!(hovering);
+        // Staying over the sprite: no re-fire.
+        assert_eq!(hover_transition(true, true, false, true, &mut hovering), None);
+        // Leave the sprite: return to base.
+        assert_eq!(
+            hover_transition(false, true, false, true, &mut hovering),
+            Some(HoverChange::ReturnToBase)
+        );
+        assert!(!hovering);
+    }
+
+    #[test]
+    fn hover_jump_suppressed_by_drag_full_output_and_missing_art() {
+        // Over the sprite but dragging: no jump.
+        let mut hovering = false;
+        assert_eq!(hover_transition(true, true, true, true, &mut hovering), None);
+        // Full-output (not docked): no jump.
+        assert_eq!(hover_transition(true, false, false, true, &mut hovering), None);
+        // No jump art (default pet): no jump.
+        assert_eq!(hover_transition(true, true, false, false, &mut hovering), None);
+        assert!(!hovering);
+        // A drag that begins while hovering forces a return-to-base edge.
+        let mut hovering = true;
+        assert_eq!(
+            hover_transition(true, true, true, true, &mut hovering),
+            Some(HoverChange::ReturnToBase)
+        );
     }
 }
