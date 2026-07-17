@@ -83,6 +83,8 @@ pub struct App {
     /// Render-thread clock epoch; the timeline runs in ms since this.
     pub started: Instant,
     pub last_state: AgentState,
+    /// First-awake wave: fires once per daemon run on the reveal edge.
+    pub greeted: bool,
     pub timer_token: Option<RegistrationToken>,
     pub loop_handle: LoopHandle<'static, App>,
     pub ui_tx: mpsc::UnboundedSender<UiAction>,
@@ -172,6 +174,7 @@ pub fn run(
         qh: qh.clone(),
         started,
         last_state: AgentState::Idle,
+        greeted: false,
         timer_token: None,
         loop_handle: handle.clone(),
         ui_tx,
@@ -351,6 +354,28 @@ impl App {
                 debug!(?window, "active window settled");
                 let _ = self.ui_tx.send(UiAction::ActiveWindowChanged { window });
             }
+        }
+    }
+
+    /// First-awake greeting: on the reveal edge, wave once (burst 3x ->
+    /// idle). Skipped when something is already pending (the alert takes
+    /// precedence) or when the pet has no waving art (the default pet leaves
+    /// row 3 blank). One-time per daemon run.
+    pub(crate) fn maybe_greet(&mut self) {
+        if self.greeted {
+            return;
+        }
+        self.greeted = true;
+        if self.last_state != AgentState::Idle {
+            return;
+        }
+        let Some(waving) = self.pet.animations.get("waving") else {
+            return;
+        };
+        let indices: Vec<usize> = waving.frames.iter().map(|f| f.sprite_index).collect();
+        if self.sheet.any_visible(indices) {
+            debug!("first-awake greeting wave");
+            self.timeline.request_state("waving", self.now_ms());
         }
     }
 
@@ -641,6 +666,7 @@ impl App {
             // Never unmapped (startup-hidden): the first configure is still
             // valid, attach straight away.
             self.mascot.visibility = Visibility::Visible;
+            self.maybe_greet();
             self.render_frame();
             self.ensure_timer();
         } else {

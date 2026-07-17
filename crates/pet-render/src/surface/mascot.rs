@@ -290,6 +290,7 @@ impl LayerShellHandler for App {
             Visibility::Hidden => {}
             Visibility::Remapping => {
                 self.mascot.visibility = Visibility::Visible;
+                self.maybe_greet();
                 self.render_frame();
                 self.ensure_timer();
             }

@@ -103,6 +103,15 @@ impl Sheet {
         self.base.len()
     }
 
+    /// True when any of the given frames has visible (alpha > 0) content.
+    /// Guards gesture animations against pets whose row is blank (e.g. the
+    /// default pet leaves rows 1-4 transparent, so it must not "wave" nothing).
+    pub fn any_visible(&self, frames: impl IntoIterator<Item = usize>) -> bool {
+        frames
+            .into_iter()
+            .any(|i| self.vspans.get(i).is_some_and(|&(t, b)| t < b))
+    }
+
     /// Frames scaled by an integer factor (nearest-neighbor), cached.
     pub fn frames_at(&mut self, factor: u32) -> &[Vec<u8>] {
         let factor = factor.max(1);
@@ -164,6 +173,17 @@ mod tests {
     #[test]
     fn rejects_non_tiling_grid() {
         assert!(Sheet::from_rgba(&[0; 8], 2, 1, 3, 1).is_err());
+    }
+
+    #[test]
+    fn any_visible_detects_blank_vs_inked_frames() {
+        // 2x1 sheet of 1x1: frame 0 transparent, frame 1 opaque.
+        let rgba = [0, 0, 0, 0, 5, 5, 5, 255];
+        let sheet = Sheet::from_rgba(&rgba, 2, 1, 1, 1).unwrap();
+        assert!(!sheet.any_visible([0]));
+        assert!(sheet.any_visible([1]));
+        assert!(sheet.any_visible([0, 1]));
+        assert!(!sheet.any_visible([99])); // out of range
     }
 
     #[test]
