@@ -17,8 +17,22 @@
 //!   - pre-threshold (`Pressed`): the small docked surface's local coords,
 //!     used only for the 4 px threshold test.
 //!   - dragging (`Dragging`): the stationary full-output surface's local
-//!     coords (== output coords). `grab` is captured lazily from the first
-//!     such motion, so the docked→full-output transition never corrupts it.
+//!     coords (== output coords).
+//!
+//! CRITICAL — the coordinate-space transition is an EXPLICIT FSM state, not a
+//! timing check. The docked -> full-output surface swap is asynchronous, so a
+//! motion event still carrying docked-local coords (~0..280) can arrive after
+//! the swap is requested. If such a motion established `grab` while `start_pos`
+//! is output-absolute (~3160), every subsequent output-absolute pointer would
+//! be offset by ~3000px and the sprite would pin to a screen edge until the
+//! cursor moved back across it.
+//!
+//! `Dragging` therefore carries `armed`: false until the caller confirms the
+//! full-output surface is live (`arm()`, wired to the resize configure ack),
+//! true after. `drag_to` DROPS every pre-arm motion (no grab, no position
+//! change); `grab` is established from the FIRST post-arm motion, which is
+//! guaranteed to be in output-absolute space. It is structurally impossible
+//! for a docked-local coordinate to seed `grab`.
 
 /// Squared click-vs-drag threshold (~4 px).
 const THRESHOLD_SQ: f64 = 16.0;
@@ -28,14 +42,17 @@ pub enum Drag {
     Idle,
     /// Button down, not yet past the threshold (docked surface-local coords).
     Pressed { grab: (f64, f64), origin: (i32, i32) },
-    /// Past the threshold; the renderer has (or is) switching to the
-    /// full-output surface. `grab` is captured from the first full-output
-    /// motion so the two coordinate spaces never mix.
+    /// Past the threshold; the surface is (being) expanded to full output.
     Dragging {
+        /// Full-output surface confirmed live (coords are output-absolute).
+        /// Set by `arm()` on the resize configure ack. Pre-arm motions are
+        /// dropped so `grab` can only come from output-absolute space.
+        armed: bool,
+        /// Established from the FIRST post-arm motion, then fixed. `None`
+        /// until then.
+        grab: Option<(f64, f64)>,
         /// Mascot top-left on the output at grab time.
         start_pos: (i32, i32),
-        /// Output-space grab point, established on first drag motion.
-        grab: Option<(f64, f64)>,
         /// Current (unclamped) mascot top-left on the output.
         pos: (i32, i32),
     },
@@ -60,15 +77,17 @@ impl Drag {
     }
 
     /// Pre-drag motion in docked surface-local coords. Returns true exactly
-    /// once, when the click-vs-drag threshold is first crossed (transition to
-    /// `Dragging`); the caller then switches to the full-output surface.
+    /// once, when the click-vs-drag threshold is first crossed: transitions to
+    /// `Dragging` in the NOT-yet-armed state. The caller then expands the
+    /// surface to full output and calls `arm()` when its configure is acked.
     pub fn threshold_crossed(&mut self, pointer: (f64, f64)) -> bool {
         if let Drag::Pressed { grab, origin } = *self {
             let (dx, dy) = (pointer.0 - grab.0, pointer.1 - grab.1);
             if dx * dx + dy * dy > THRESHOLD_SQ {
                 *self = Drag::Dragging {
-                    start_pos: origin,
+                    armed: false,
                     grab: None,
+                    start_pos: origin,
                     pos: origin,
                 };
                 return true;
@@ -77,14 +96,29 @@ impl Drag {
         false
     }
 
-    /// Drag motion in the stationary full-output surface's coords (== output
-    /// coords). Establishes the grab on first call (sprite does not jump),
-    /// then tracks 1:1. Returns the new unclamped mascot top-left, or `None`
-    /// when not dragging.
+    /// Confirm the full-output surface is live (its resize configure was
+    /// acked): subsequent pointer coords are output-absolute, so motions may
+    /// now establish `grab`. No-op unless dragging.
+    pub fn arm(&mut self) {
+        if let Drag::Dragging { armed, .. } = self {
+            *armed = true;
+        }
+    }
+
+    pub fn armed(&self) -> bool {
+        matches!(self, Drag::Dragging { armed: true, .. })
+    }
+
+    /// Drag motion in the full-output surface. While NOT armed, the motion is
+    /// DROPPED (returns `None`, no grab, no position change) — this is what
+    /// makes a docked-local coordinate unable to seed `grab`. Once armed, the
+    /// first motion establishes `grab` (from that output-absolute pointer) and
+    /// thereafter `pos = start_pos + (pointer - grab)`, exact 1:1.
     pub fn drag_to(&mut self, pointer: (f64, f64)) -> Option<(i32, i32)> {
         if let Drag::Dragging {
-            start_pos,
+            armed: true,
             grab,
+            start_pos,
             pos,
         } = self
         {
@@ -117,6 +151,17 @@ impl Drag {
 
     pub fn dragging(&self) -> bool {
         matches!(self, Drag::Dragging { .. })
+    }
+
+    /// (grab, start_pos) for diagnostics; both `None` unless dragging (and
+    /// grab is `None` until the first post-arm motion).
+    pub fn debug_grab_start(&self) -> (Option<(f64, f64)>, Option<(i32, i32)>) {
+        match self {
+            Drag::Dragging {
+                grab, start_pos, ..
+            } => (*grab, Some(*start_pos)),
+            _ => (None, None),
+        }
     }
 }
 
@@ -205,38 +250,87 @@ mod tests {
         assert_eq!(drag.release(), Release::Click);
     }
 
-    #[test]
-    fn threshold_crossing_reports_once_then_switches_to_dragging() {
+    /// Enter `Dragging` (not yet armed) via a press + threshold cross.
+    fn dragging_unarmed(start_pos: (i32, i32)) -> Drag {
         let mut drag = Drag::Idle;
-        drag.press((10.0, 10.0), (100, 200));
-        assert!(drag.threshold_crossed((15.0, 10.0)));
+        drag.press((10.0, 10.0), start_pos);
+        assert!(drag.threshold_crossed((20.0, 10.0)));
         assert!(drag.dragging());
-        // Already dragging: pre-drag motion no longer fires.
-        assert!(!drag.threshold_crossed((99.0, 99.0)));
+        assert!(!drag.armed());
+        drag
     }
 
     #[test]
-    fn drag_is_absolute_offset_from_a_lazily_captured_grab() {
-        let mut drag = Drag::Idle;
-        drag.press((10.0, 10.0), (100, 200));
-        drag.threshold_crossed((15.0, 10.0)); // start_pos = (100,200)
-        // First full-output motion captures the grab; sprite does not jump.
+    fn motion_before_arm_is_dropped_and_does_not_establish_grab() {
+        let mut drag = dragging_unarmed((3160, 700));
+        // Pre-arm motions are ignored entirely: None, no grab, no pos change.
+        assert_eq!(drag.drag_to((150.0, 40.0)), None);
+        assert_eq!(drag.drag_to((151.0, 41.0)), None);
+        assert_eq!(drag.drag_pos(), Some((3160, 700))); // unchanged
+        let (grab, _) = drag.debug_grab_start();
+        assert_eq!(grab, None); // grab never seeded by a pre-arm motion
+    }
+
+    #[test]
+    fn first_motion_after_arm_establishes_grab_from_that_pointer() {
+        let mut drag = dragging_unarmed((3160, 700));
+        // Several pre-arm (docked-local-looking) motions: all ignored.
+        drag.drag_to((150.0, 40.0));
+        drag.drag_to((160.0, 45.0));
+        drag.drag_to((170.0, 50.0));
+        assert_eq!(drag.debug_grab_start().0, None);
+        // Arm, then the FIRST motion sets grab from THAT pointer (not earlier).
+        drag.arm();
+        assert_eq!(drag.drag_to((3200.0, 680.0)), Some((3160, 700))); // no jump
+        assert_eq!(drag.debug_grab_start().0, Some((3200.0, 680.0)));
+    }
+
+    #[test]
+    fn post_arm_tracking_is_1_to_1() {
+        let mut drag = dragging_unarmed((100, 200));
+        drag.arm();
+        // First post-arm motion = grab; sprite stays at start_pos.
         assert_eq!(drag.drag_to((500.0, 400.0)), Some((100, 200)));
-        // Thereafter, pos = start_pos + (pointer - grab), exact 1:1.
+        // pos = start_pos + (pointer - grab), exact 1:1.
         assert_eq!(drag.drag_to((530.0, 380.0)), Some((130, 180)));
         assert_eq!(drag.drag_to((500.0, 400.0)), Some((100, 200)));
-        // A stationary pointer holds position exactly — no drift, no snap.
+        // Stationary pointer holds exactly — no drift.
         assert_eq!(drag.drag_to((500.0, 400.0)), Some((100, 200)));
-        assert_eq!(drag.drag_to((500.0, 400.0)), Some((100, 200)));
+    }
+
+    #[test]
+    fn the_exact_pin_bug_pre_arm_docked_then_arm_output_tracks_correctly() {
+        // start_pos output-absolute (~3160); a docked-local motion (~150)
+        // arrives BEFORE arm and must not seed grab. After arm, a large
+        // output-absolute motion sets grab and tracking is correct.
+        let mut drag = dragging_unarmed((3160, 700));
+        assert_eq!(drag.drag_to((150.0, 40.0)), None); // docked-local, dropped
+        assert_eq!(drag.drag_pos(), Some((3160, 700))); // not pinned
+        drag.arm();
+        // First output-absolute motion establishes grab (no jump)...
+        assert_eq!(drag.drag_to((3120.0, 680.0)), Some((3160, 700)));
+        // ...and subsequent motions track 1:1 (would be pinned ~6000 if the
+        // docked-local 150 had seeded grab). grab=(3120,680), start=(3160,700).
+        assert_eq!(drag.drag_to((3200.0, 660.0)), Some((3240, 680)));
+        assert_eq!(drag.drag_to((1440.0, 700.0)), Some((1480, 720)));
+    }
+
+    #[test]
+    fn drag_tracks_1_to_1_over_large_distances_no_scale() {
+        let mut drag = dragging_unarmed((3160, 700));
+        drag.arm();
+        drag.drag_to((3160.0, 700.0)); // grab
+        // Move the pointer 1720px left (half a 3440 monitor): the pet moves
+        // exactly 1720px left. A scale/divide in the path would fail here.
+        assert_eq!(drag.drag_to((1440.0, 700.0)), Some((3160 - 1720, 700)));
+        assert_eq!(drag.drag_to((3160.0, 100.0)), Some((3160, 100)));
     }
 
     #[test]
     fn no_feedback_loop_repeated_same_pointer_is_stable() {
-        // The old accumulated-delta bug: identical coords must NOT drift.
-        let mut drag = Drag::Idle;
-        drag.press((0.0, 0.0), (1000, 500));
-        drag.threshold_crossed((0.0, 6.0));
-        drag.drag_to((2000.0, 1000.0)); // grab here
+        let mut drag = dragging_unarmed((1000, 500));
+        drag.arm();
+        drag.drag_to((2000.0, 1000.0)); // grab
         for _ in 0..100 {
             assert_eq!(drag.drag_to((2010.0, 1005.0)), Some((1010, 505)));
         }
@@ -244,9 +338,8 @@ mod tests {
 
     #[test]
     fn fractional_pointer_rounds_per_report_without_accumulating() {
-        let mut drag = Drag::Idle;
-        drag.press((0.0, 0.0), (0, 0));
-        drag.threshold_crossed((5.0, 0.0));
+        let mut drag = dragging_unarmed((0, 0));
+        drag.arm();
         drag.drag_to((100.0, 100.0)); // grab
         assert_eq!(drag.drag_to((103.6, 100.4)), Some((4, 0)));
         assert_eq!(drag.drag_to((100.4, 100.6)), Some((0, 1)));
@@ -254,7 +347,7 @@ mod tests {
     }
 
     #[test]
-    fn drag_to_before_threshold_is_none() {
+    fn drag_to_before_dragging_is_none() {
         let mut drag = Drag::Idle;
         assert_eq!(drag.drag_to((50.0, 50.0)), None);
         drag.press((0.0, 0.0), (10, 10));
@@ -262,11 +355,22 @@ mod tests {
     }
 
     #[test]
-    fn release_semantics() {
+    fn release_from_any_substate_returns_cleanly() {
+        // Idle.
         let mut drag = Drag::Idle;
         assert_eq!(drag.release(), Release::None);
+        // Pressed (never past threshold) -> Click.
         drag.press((0.0, 0.0), (10, 10));
-        drag.threshold_crossed((0.0, 9.0));
+        assert_eq!(drag.release(), Release::Click);
+        assert_eq!(drag, Drag::Idle);
+        // Dragging, unarmed -> Dropped.
+        let mut drag = dragging_unarmed((10, 10));
+        assert_eq!(drag.release(), Release::Dropped);
+        assert_eq!(drag, Drag::Idle);
+        // Dragging, armed, mid-track -> Dropped.
+        let mut drag = dragging_unarmed((10, 10));
+        drag.arm();
+        drag.drag_to((50.0, 50.0));
         assert_eq!(drag.release(), Release::Dropped);
         assert_eq!(drag.drag_pos(), None);
         assert_eq!(drag, Drag::Idle);

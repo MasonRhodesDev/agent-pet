@@ -609,28 +609,68 @@ impl App {
     /// Threshold crossed: expand to the stationary full-output surface. The
     /// sprite holds its docked position until that surface configures and the
     /// first full-output motion establishes the grab — no jump, no feedback.
+    /// Threshold crossed: the drag FSM is now `Dragging` but NOT armed. Expand
+    /// to the stationary full-output surface; the FSM is armed (allowed to
+    /// establish grab) only when that surface's configure is acked, so no
+    /// docked-local motion can seed the drag. See input/drag.rs.
     pub(crate) fn begin_drag(&mut self) {
         self.drag_frame_pending = false;
         self.drag_dirty = false;
         self.hovering = false; // hover-jump is docked-only; clean slate
+
         // Only walk if the pet has directional walk art (both rows); the
         // default pet's rows 1-2 are blank, so it slides on its base track.
         self.walk = (self.track_has_art("running-right") && self.track_has_art("running-left"))
             .then(|| Walk::new(self.position.margin_x));
-        if let Err(e) = self.mascot.enter_drag(&self.compositor_state) {
+        // The drag surface must be the full output so surface-local pointer
+        // coords equal output coords and the sprite can range across it.
+        let dims = self
+            .output_logical()
+            .map(|(w, h)| (w as u32, h as u32))
+            .unwrap_or((self.mascot.surf_w, self.mascot.surf_h));
+        info!(dims_w = dims.0, dims_h = dims.1, "begin drag (awaiting arm)");
+        if let Err(e) = self.mascot.enter_drag(&self.compositor_state, dims) {
             warn!("enter drag surface failed: {e:#}");
             self.walk = None;
             self.drag.release();
         }
     }
 
+    /// The full-output drag surface's resize configure was acked (its buffer
+    /// committed): pointer coords are now output-absolute. Arm the FSM so the
+    /// next motion may establish grab.
+    pub(crate) fn arm_drag(&mut self) {
+        self.drag.arm();
+        debug!("drag armed: full-output surface live");
+    }
+
     /// A drag motion in full-output (== output) coords. Records the target,
     /// updates the walk direction (transientState overrides the base state),
     /// and schedules a frame-rate-limited render.
     pub(crate) fn on_drag_motion(&mut self, pointer: (f64, f64)) {
-        let Some((x, _)) = self.drag.drag_to(pointer) else {
+        if !self.drag.armed() {
+            // Dropped pre-arm motion (surface not yet confirmed full-output).
+            debug!(ptr_x = pointer.0, ptr_y = pointer.1, "drag motion dropped (pre-arm)");
+        }
+        let Some((x, y)) = self.drag.drag_to(pointer) else {
             return;
         };
+        // Captured AFTER drag_to so `grab` shows the established value. It must
+        // be output-absolute (~thousands), never docked-local (~0-280).
+        let (grab, start) = self.drag.debug_grab_start();
+        debug!(
+            ptr_x = pointer.0,
+            ptr_y = pointer.1,
+            grab_x = grab.map(|g| g.0),
+            grab_y = grab.map(|g| g.1),
+            start_x = start.map(|s| s.0),
+            start_y = start.map(|s| s.1),
+            pos_x = x,
+            pos_y = y,
+            dims_w = self.mascot.drag_dims.0,
+            dims_h = self.mascot.drag_dims.1,
+            "drag motion"
+        );
         if let Some(dir) = self.walk.as_mut().and_then(|w| w.update(x)) {
             self.timeline.request_loop(dir.track(), self.now_ms());
         }

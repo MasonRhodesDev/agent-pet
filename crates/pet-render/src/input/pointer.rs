@@ -99,14 +99,11 @@ impl PointerHandler for App {
                 }
                 PointerEventKind::Motion { .. } => {
                     if self.mascot.mode == SurfaceMode::Drag {
-                        // Stationary full-output surface: coords are output
-                        // coords. Feed them straight to the absolute-offset
-                        // drag (only once the resize has been acked, so we
-                        // never mix the docked and full-output spaces).
-                        if !self.mascot.resizing {
-                            self.on_drag_motion(event.position);
-                            self.set_cursor(Cursor::Grabbing);
-                        }
+                        // Feed every motion to the FSM; it DROPS pre-arm
+                        // motions internally (armed state), so no docked-local
+                        // coordinate can seed grab. No `resizing` check here.
+                        self.on_drag_motion(event.position);
+                        self.set_cursor(Cursor::Grabbing);
                     } else if self.drag.threshold_crossed(event.position) {
                         // Docked surface: cross the click-vs-drag threshold ->
                         // expand to the full-output drag surface.

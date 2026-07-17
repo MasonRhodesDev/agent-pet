@@ -132,15 +132,20 @@ impl Mascot {
     }
 
     /// Expand to a stationary full-output surface for dragging: anchor all
-    /// four edges with size 0 (the compositor fills the output and reports
-    /// the size in the configure), margins 0, whole-surface input region.
-    /// The pointer can never escape and surface-local == output coords.
-    pub fn enter_drag(&mut self, compositor: &CompositorState) -> Result<()> {
+    /// four edges at the output's *explicit logical size* (not size 0 — some
+    /// compositors report new_size (0,0) for size-0 anchored surfaces, which
+    /// would leave `drag_dims` at the tiny docked size and clamp the sprite
+    /// to a few px). Margins 0, whole-surface input region. The pointer can
+    /// never escape and surface-local coords == output logical coords.
+    pub fn enter_drag(&mut self, compositor: &CompositorState, dims: (u32, u32)) -> Result<()> {
         self.mode = SurfaceMode::Drag;
         self.resizing = true;
+        // Authoritative from the known output size, so the clamp range and
+        // the buffer are correct even before / regardless of the configure.
+        self.drag_dims = dims;
         self.layer
             .set_anchor(Anchor::TOP | Anchor::LEFT | Anchor::BOTTOM | Anchor::RIGHT);
-        self.layer.set_size(0, 0);
+        self.layer.set_size(dims.0, dims.1);
         self.layer.set_margin(0, 0, 0, 0);
         self.layer.set_exclusive_zone(-1);
         self.update_input_region(compositor)?;
@@ -268,8 +273,18 @@ impl LayerShellHandler for App {
             if w > 0 && h > 0 {
                 self.mascot.drag_dims = (w, h);
             }
+            info!(
+                new_w = w,
+                new_h = h,
+                drag_w = self.mascot.drag_dims.0,
+                drag_h = self.mascot.drag_dims.1,
+                "drag surface configured"
+            );
             self.mascot.resizing = false;
+            // Commit the full-output buffer (acks the resize), then arm the
+            // FSM: coords are now output-absolute, so motions may seed grab.
             self.render_frame();
+            self.arm_drag();
             return;
         }
 
