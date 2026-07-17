@@ -47,19 +47,32 @@ fn try_run(rest: &[&str]) -> anyhow::Result<()> {
 /// For Stop / generic Notification, read the last assistant message from the
 /// transcript so the alert says something specific. Bounded and time-guarded
 /// so a hook is never slowed.
-fn claude_tail(json: &str) -> Option<String> {
-    let payload: pet_adapters::claude::ClaudeHookPayload = serde_json::from_str(json).ok()?;
+fn claude_tail(json: &str) -> pet_adapters::claude::Tail {
+    use pet_adapters::claude::{ClaudeHookPayload, Tail};
+    let Ok(payload) = serde_json::from_str::<ClaudeHookPayload>(json) else {
+        return Tail::default();
+    };
     match payload.hook_event_name.as_str() {
         "Stop" | "Notification" => {}
-        _ => return None,
+        _ => return Tail::default(),
     }
-    transcript_tail(payload.transcript_path.as_deref()?)
+    payload
+        .transcript_path
+        .as_deref()
+        .map(transcript_tail)
+        .unwrap_or_default()
 }
 
 /// Scan the tail of a Claude transcript JSONL for the last assistant text.
 /// Reads at most the final 64 KiB and reverse-scans lines, so cost is a few
-/// `serde_json` parses regardless of transcript size.
-fn transcript_tail(path: &str) -> Option<String> {
+/// `serde_json` parses regardless of transcript size. The returned `Tail`
+/// also flags `isApiErrorMessage` entries (a turn that died on an API error).
+fn transcript_tail(path: &str) -> pet_adapters::claude::Tail {
+    transcript_tail_inner(path).unwrap_or_default()
+}
+
+fn transcript_tail_inner(path: &str) -> Option<pet_adapters::claude::Tail> {
+    use pet_adapters::claude::Tail;
     use std::io::{Read, Seek, SeekFrom};
 
     const WINDOW: u64 = 64 * 1024;
@@ -94,7 +107,7 @@ fn transcript_tail(path: &str) -> Option<String> {
         // A pending AskUserQuestion is the actual thing needing input — show
         // the question, not "needs permission to use AskUserQuestion".
         if let Some(q) = blocks.iter().find_map(ask_user_question) {
-            return Some(q);
+            return Some(Tail::text(Some(q)));
         }
         let text: Vec<&str> = blocks
             .iter()
@@ -102,7 +115,16 @@ fn transcript_tail(path: &str) -> Option<String> {
             .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
             .collect();
         if !text.is_empty() {
-            return Some(text.join("\n"));
+            // Claude tags a turn that died on an API error (overload, dropped
+            // stream, 5xx) with isApiErrorMessage — that turn is Blocked.
+            let is_error = v
+                .get("isApiErrorMessage")
+                .and_then(|e| e.as_bool())
+                .unwrap_or(false);
+            return Some(Tail {
+                text: Some(text.join("\n")),
+                is_error,
+            });
         }
     }
     None
@@ -326,7 +348,7 @@ mod tests {
             r#"{"type":"system","event":"x"}"#,
         ]);
         assert_eq!(
-            transcript_tail(f.path().to_str().unwrap()).as_deref(),
+            transcript_tail(f.path().to_str().unwrap()).text.as_deref(),
             Some("the real answer")
         );
     }
@@ -339,7 +361,7 @@ mod tests {
             "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"tex",
         ]);
         assert_eq!(
-            transcript_tail(f.path().to_str().unwrap()).as_deref(),
+            transcript_tail(f.path().to_str().unwrap()).text.as_deref(),
             Some("prior good line")
         );
     }
@@ -350,9 +372,26 @@ mod tests {
             r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Let me ask."},{"type":"tool_use","name":"AskUserQuestion","input":{"questions":[{"question":"Which DB?","header":"DB"},{"question":"Which region?"}]}}]}}"#,
         ]);
         assert_eq!(
-            transcript_tail(f.path().to_str().unwrap()).as_deref(),
+            transcript_tail(f.path().to_str().unwrap()).text.as_deref(),
             Some("Which DB? (+1 more)")
         );
+    }
+
+    #[test]
+    fn transcript_tail_flags_api_error_entries() {
+        let f = write_transcript(&[
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"working on it"}]}}"#,
+            r#"{"type":"assistant","isApiErrorMessage":true,"message":{"role":"assistant","content":[{"type":"text","text":"API Error: Connection closed mid-response."}]}}"#,
+        ]);
+        let tail = transcript_tail(f.path().to_str().unwrap());
+        assert!(tail.is_error);
+        assert_eq!(tail.text.as_deref(), Some("API Error: Connection closed mid-response."));
+
+        // A clean final answer is not an error.
+        let f = write_transcript(&[
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"all done"}]}}"#,
+        ]);
+        assert!(!transcript_tail(f.path().to_str().unwrap()).is_error);
     }
 
     #[test]
@@ -361,8 +400,8 @@ mod tests {
             r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"hi"}]}}"#,
             r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","name":"Read"}]}}"#,
         ]);
-        assert_eq!(transcript_tail(f.path().to_str().unwrap()), None);
-        assert_eq!(transcript_tail("/no/such/file"), None);
+        assert_eq!(transcript_tail(f.path().to_str().unwrap()).text, None);
+        assert_eq!(transcript_tail("/no/such/file").text, None);
     }
 
     #[test]

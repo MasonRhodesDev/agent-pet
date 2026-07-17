@@ -36,6 +36,17 @@ pub fn map_hook(json: &str, agent_pid: Option<u32>) -> Result<Option<Event>, ser
             AgentState::Ready,
             payload.last_assistant_message.as_deref().and_then(hygiene::body),
         ),
+        // A turn that died on an error (overload, rate-limit, non-retryable)
+        // is Blocked — the same signal the real Codex TUI shows via on_error.
+        // Codex's error hook naming has varied; match liberally.
+        "error" | "turnfailed" | "turnaborted" | "turnerror" => (
+            AgentState::Failed,
+            payload
+                .message
+                .as_deref()
+                .or(payload.last_assistant_message.as_deref())
+                .and_then(hygiene::body),
+        ),
         "sessionend" => (AgentState::Gone, None),
         _ => return Ok(None),
     };
@@ -143,6 +154,8 @@ struct NotifyPayload {
     #[serde(rename = "last-assistant-message", default)]
     last_assistant_message: Option<String>,
     #[serde(default)]
+    message: Option<String>,
+    #[serde(default)]
     cwd: Option<String>,
 }
 
@@ -152,10 +165,22 @@ struct NotifyPayload {
 pub fn map_notify(json: &str) -> Result<Option<Event>, serde_json::Error> {
     let payload: NotifyPayload = serde_json::from_str(json)?;
 
-    if normalize(&payload.kind) != "agentturncomplete" {
-        return Ok(None);
-    }
-    let state = AgentState::Ready;
+    let (state, body) = match normalize(&payload.kind).as_str() {
+        "agentturncomplete" => (
+            AgentState::Ready,
+            payload.last_assistant_message.as_deref().and_then(hygiene::body),
+        ),
+        // A turn that ended on an error → Blocked (Codex's own on_error state).
+        "turnfailed" | "error" | "turnaborted" | "turnerror" | "agentturnerror" => (
+            AgentState::Failed,
+            payload
+                .message
+                .as_deref()
+                .or(payload.last_assistant_message.as_deref())
+                .and_then(hygiene::body),
+        ),
+        _ => return Ok(None),
+    };
 
     let Some(session) = payload
         .thread_id
@@ -171,7 +196,7 @@ pub fn map_notify(json: &str) -> Result<Option<Event>, serde_json::Error> {
         source: Source::Codex,
         session,
         state,
-        body: payload.last_assistant_message.as_deref().and_then(hygiene::body),
+        body,
         ts: None,
         via: None,
         meta: Meta {
@@ -298,6 +323,26 @@ mod tests {
         assert!(map_notify(r#"{"type":"something-else","turn-id":"t9"}"#)
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn turn_error_maps_to_blocked_in_both_taps() {
+        // Hook tap: an error/aborted turn hook → Blocked with its message.
+        for name in ["error", "turn_failed", "turn-aborted", "TurnError"] {
+            let json = format!(
+                r#"{{"hook_event_name":"{name}","session_id":"t","message":"stream disconnected"}}"#
+            );
+            let ev = map_hook(&json, None).unwrap().unwrap();
+            assert_eq!(ev.state, AgentState::Failed, "{name}");
+            assert_eq!(ev.body.as_deref(), Some("stream disconnected"), "{name}");
+        }
+
+        // Notify tap: an error kind → Blocked, still resolving the session.
+        let n = r#"{"type":"turn-failed","thread-id":"th1","message":"model overloaded"}"#;
+        let ev = map_notify(n).unwrap().unwrap();
+        assert_eq!(ev.state, AgentState::Failed);
+        assert_eq!(ev.session, "th1");
+        assert_eq!(ev.body.as_deref(), Some("model overloaded"));
     }
 
     #[test]

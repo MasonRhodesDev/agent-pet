@@ -41,6 +41,22 @@ pub struct ClaudeHookPayload {
     pub tool_input: Option<serde_json::Value>,
 }
 
+/// The transcript tail the emitter read for a Stop / idle-Notification event.
+/// `is_error` marks an `isApiErrorMessage` entry — a turn that died on an API
+/// error (overload, dropped stream, 5xx). That is Blocked, not a clean Ready.
+#[derive(Debug, Default, Clone)]
+pub struct Tail {
+    pub text: Option<String>,
+    pub is_error: bool,
+}
+
+impl Tail {
+    /// A plain (non-error) tail carrying just assistant text.
+    pub fn text(text: Option<String>) -> Self {
+        Self { text, is_error: false }
+    }
+}
+
 /// Does a Notification message name a specific pending action (a permission
 /// prompt) rather than the generic idle "waiting for your input"?
 pub fn is_permission_message(message: &str) -> bool {
@@ -62,10 +78,15 @@ pub fn is_question_prompt(message: &str) -> bool {
 pub fn map_hook(
     json: &str,
     agent_pid: Option<u32>,
-    tail: Option<String>,
+    tail: Tail,
 ) -> Result<Option<Event>, serde_json::Error> {
     let payload: ClaudeHookPayload = serde_json::from_str(json)?;
-    let tail_body = tail.as_deref().and_then(hygiene::body);
+    let tail_body = tail.text.as_deref().and_then(hygiene::body);
+    // A turn that ended on an API error leaves an isApiErrorMessage entry as
+    // the transcript tail. A turn *ending* (Stop, or the idle Notification
+    // that trails it) is Ready normally, but Blocked when that tail is an
+    // error — the only path to `failed` for a first-class harness.
+    let ended = |ok| if tail.is_error { AgentState::Failed } else { ok };
 
     let (state, body) = match payload.hook_event_name.as_str() {
         "SessionStart" => (AgentState::Running, None),
@@ -87,13 +108,14 @@ pub fn map_hook(
             // The generic idle "Claude is waiting for your input" fires ~60s
             // after any turn ends; nothing is actually blocked, so it is NOT
             // needs-input — it means "done, look whenever" → ready, showing
-            // what Claude last said.
+            // what Claude last said. Unless that turn died on an API error,
+            // which is Blocked.
             other => (
-                AgentState::Ready,
+                ended(AgentState::Ready),
                 tail_body.clone().or_else(|| other.and_then(hygiene::body)),
             ),
         },
-        "Stop" => (AgentState::Ready, tail_body.clone()),
+        "Stop" => (ended(AgentState::Ready), tail_body.clone()),
         "SessionEnd" => (AgentState::Gone, payload.reason.clone()),
         _ => return Ok(None),
     };
@@ -131,7 +153,7 @@ mod tests {
             (r#"{"hook_event_name":"SessionEnd","session_id":"s1","reason":"exit"}"#, AgentState::Gone),
         ];
         for (json, want) in cases {
-            let ev = map_hook(json, Some(99), None).unwrap().expect(json);
+            let ev = map_hook(json, Some(99), Tail::default()).unwrap().expect(json);
             assert_eq!(ev.state, want, "{json}");
             assert_eq!(ev.session, "s1");
             assert_eq!(ev.meta.agent_pid, Some(99));
@@ -141,13 +163,13 @@ mod tests {
     #[test]
     fn stop_body_comes_from_transcript_tail() {
         let json = r#"{"hook_event_name":"Stop","session_id":"s"}"#;
-        let ev = map_hook(json, None, Some("## Done\n\nAll **green**.".into()))
+        let ev = map_hook(json, None, Tail::text(Some("## Done\n\nAll **green**.".into())))
             .unwrap()
             .unwrap();
         assert_eq!(ev.state, AgentState::Ready);
         assert_eq!(ev.body.as_deref(), Some("Done All green."));
         // No tail → no invented body.
-        let ev = map_hook(json, None, None).unwrap().unwrap();
+        let ev = map_hook(json, None, Tail::default()).unwrap().unwrap();
         assert_eq!(ev.body, None);
     }
 
@@ -156,14 +178,14 @@ mod tests {
         // The idle "waiting for your input" fires after every turn ends;
         // nothing is blocked, so it must NOT nag as needs-input.
         let generic = r#"{"hook_event_name":"Notification","session_id":"s","message":"Claude is waiting for your input"}"#;
-        let ev = map_hook(generic, None, Some("Should I deploy to staging?".into()))
+        let ev = map_hook(generic, None, Tail::text(Some("Should I deploy to staging?".into())))
             .unwrap()
             .unwrap();
         assert_eq!(ev.state, AgentState::Ready);
         assert_eq!(ev.body.as_deref(), Some("Should I deploy to staging?"));
 
         // Without a tail, the generic message is the fallback caption.
-        let ev = map_hook(generic, None, None).unwrap().unwrap();
+        let ev = map_hook(generic, None, Tail::default()).unwrap().unwrap();
         assert_eq!(ev.state, AgentState::Ready);
         assert_eq!(ev.body.as_deref(), Some("Claude is waiting for your input"));
     }
@@ -173,7 +195,7 @@ mod tests {
         // A genuine approval blocks progress → waiting, keeping its text over
         // any transcript tail.
         let perm = r#"{"hook_event_name":"Notification","session_id":"s","message":"Claude needs your permission to use Bash"}"#;
-        let ev = map_hook(perm, None, Some("some unrelated tail".into()))
+        let ev = map_hook(perm, None, Tail::text(Some("some unrelated tail".into())))
             .unwrap()
             .unwrap();
         assert_eq!(ev.state, AgentState::Waiting);
@@ -181,11 +203,35 @@ mod tests {
     }
 
     #[test]
+    fn api_error_tail_makes_a_turn_end_blocked() {
+        // A Stop (or the idle Notification trailing it) whose transcript tail
+        // is an isApiErrorMessage entry is Blocked, not Ready — carrying the
+        // error text so the bubble says what broke.
+        let err = Tail {
+            text: Some("API Error: Connection closed mid-response.".into()),
+            is_error: true,
+        };
+        for json in [
+            r#"{"hook_event_name":"Stop","session_id":"s"}"#,
+            r#"{"hook_event_name":"Notification","session_id":"s","message":"Claude is waiting for your input"}"#,
+        ] {
+            let ev = map_hook(json, None, err.clone()).unwrap().unwrap();
+            assert_eq!(ev.state, AgentState::Failed, "{json}");
+            assert_eq!(ev.body.as_deref(), Some("API Error: Connection closed mid-response."));
+        }
+
+        // A permission prompt is still needs-input even if an earlier turn
+        // errored — the pending approval is what matters now.
+        let perm = r#"{"hook_event_name":"Notification","session_id":"s","message":"Claude needs your permission to use Bash"}"#;
+        assert_eq!(map_hook(perm, None, err).unwrap().unwrap().state, AgentState::Waiting);
+    }
+
+    #[test]
     fn carries_meta() {
         let ev = map_hook(
             r#"{"hook_event_name":"Notification","session_id":"s","message":"Permission to edit","cwd":"/repo","transcript_path":"/t.jsonl"}"#,
             None,
-            None,
+            Tail::default(),
         )
         .unwrap()
         .unwrap();
@@ -195,14 +241,14 @@ mod tests {
 
     #[test]
     fn ignores_unknown_hooks_and_caps_long_prompts() {
-        assert!(map_hook(r#"{"hook_event_name":"PreCompact","session_id":"s"}"#, None, None)
+        assert!(map_hook(r#"{"hook_event_name":"PreCompact","session_id":"s"}"#, None, Tail::default())
             .unwrap()
             .is_none());
         let long = "x".repeat(500);
         let json = format!(
             r#"{{"hook_event_name":"UserPromptSubmit","session_id":"s","prompt":"{long}"}}"#
         );
-        let ev = map_hook(&json, None, None).unwrap().unwrap();
+        let ev = map_hook(&json, None, Tail::default()).unwrap().unwrap();
         use unicode_segmentation::UnicodeSegmentation;
         assert!(ev.body.unwrap().graphemes(true).count() <= hygiene::BODY_MAX);
     }
@@ -213,7 +259,7 @@ mod tests {
         // replaced by the actual question from the transcript tail, but it
         // still counts as needs-input.
         let n = r#"{"hook_event_name":"Notification","session_id":"s","message":"Claude needs your permission to use AskUserQuestion"}"#;
-        let ev = map_hook(n, None, Some("Which database should we use?".into()))
+        let ev = map_hook(n, None, Tail::text(Some("Which database should we use?".into())))
             .unwrap()
             .unwrap();
         assert_eq!(ev.state, AgentState::Waiting);
