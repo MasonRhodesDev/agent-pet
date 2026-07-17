@@ -607,7 +607,6 @@ impl App {
         let Some((mx, my)) = self.drag.drag_to(pointer) else {
             return;
         };
-        debug!(ptr_x = pointer.0, ptr_y = pointer.1, mx, my, "drag motion");
         self.position.margin_x = mx;
         self.position.margin_y = my;
         self.mascot.apply_margins(&self.position); // no relayout: quadrant frozen

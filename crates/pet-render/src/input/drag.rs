@@ -129,37 +129,48 @@ impl WalkDir {
     }
 }
 
-/// Tracks the drag's horizontal travel and decides the walk direction.
+/// Decides the walk direction from the drag's *smoothed* horizontal
+/// velocity, so hand jitter while dragging one way doesn't flip the sprite
+/// back and forth. Direction only changes when the exponential moving
+/// average of per-motion travel clearly reverses past a dead zone.
 #[derive(Debug, Clone, Copy)]
 pub struct Walk {
-    ref_x: i32,
+    last_x: i32,
+    /// EMA of horizontal travel per motion (px), signed.
+    vel: f64,
     dir: Option<WalkDir>,
 }
 
-/// Net horizontal move (px) before the walk direction flips.
-const WALK_THRESHOLD: i32 = 4;
+/// EMA weight of the newest sample. Lower = smoother / more history.
+const VEL_ALPHA: f64 = 0.2;
+/// Smoothed velocity magnitude needed to commit/hold a direction. Between
+/// −FLIP and +FLIP the current direction is kept (the dead zone that stops
+/// the flip-flop).
+const VEL_FLIP: f64 = 1.0;
 
 impl Walk {
     pub fn new(start_x: i32) -> Self {
         Self {
-            ref_x: start_x,
+            last_x: start_x,
+            vel: 0.0,
             dir: None,
         }
     }
 
-    /// Feed the current mascot x. Returns `Some(dir)` only when the walk
-    /// direction changes (>= 4px net move since the last change), so the
-    /// caller can switch the looping walk track without restarting it.
+    /// Feed the current mascot x. Returns `Some(dir)` only when the smoothed
+    /// direction actually changes, so the caller can switch the looping walk
+    /// track without restarting it every frame.
     pub fn update(&mut self, x: i32) -> Option<WalkDir> {
-        let dx = x - self.ref_x;
-        let new = if dx >= WALK_THRESHOLD {
+        let dx = (x - self.last_x) as f64;
+        self.last_x = x;
+        self.vel = VEL_ALPHA * dx + (1.0 - VEL_ALPHA) * self.vel;
+        let new = if self.vel >= VEL_FLIP {
             WalkDir::Right
-        } else if dx <= -WALK_THRESHOLD {
+        } else if self.vel <= -VEL_FLIP {
             WalkDir::Left
         } else {
-            return None; // within hysteresis: keep the current direction
+            return None; // dead zone: keep the current direction
         };
-        self.ref_x = x;
         if Some(new) != self.dir {
             self.dir = Some(new);
             Some(new)
@@ -258,11 +269,61 @@ mod tests {
     }
 
     #[test]
-    fn walk_direction_flips_with_hysteresis() {
+    fn walk_commits_a_direction_and_holds_it() {
         let mut walk = Walk::new(0);
-        assert_eq!(walk.update(2), None); // within threshold
-        assert_eq!(walk.update(5), Some(WalkDir::Right));
-        assert_eq!(walk.update(8), None); // same direction, no re-fire
-        assert_eq!(walk.update(0), Some(WalkDir::Left));
+        // Steady rightward travel commits Right, then holds (no re-fire).
+        let mut x = 0;
+        let mut fired = None;
+        for _ in 0..10 {
+            x += 4;
+            if let Some(d) = walk.update(x) {
+                fired = Some(d);
+            }
+        }
+        assert_eq!(fired, Some(WalkDir::Right));
+        assert_eq!(walk.dir(), Some(WalkDir::Right));
+    }
+
+    #[test]
+    fn walk_ignores_jitter_against_the_overall_direction() {
+        let mut walk = Walk::new(0);
+        // Establish leftward motion.
+        let mut x = 0;
+        for _ in 0..10 {
+            x -= 4;
+            walk.update(x);
+        }
+        assert_eq!(walk.dir(), Some(WalkDir::Left));
+        // A few small rightward jitters while still moving left overall must
+        // NOT flip the direction.
+        for step in [3, -5, 2, -6, 1, -4] {
+            x += step;
+            let flipped = walk.update(x);
+            assert!(
+                flipped != Some(WalkDir::Right),
+                "jitter flipped to Right at x={x}"
+            );
+        }
+        assert_eq!(walk.dir(), Some(WalkDir::Left));
+    }
+
+    #[test]
+    fn walk_flips_on_a_sustained_reversal() {
+        let mut walk = Walk::new(0);
+        let mut x = 0;
+        for _ in 0..10 {
+            x -= 4;
+            walk.update(x);
+        }
+        assert_eq!(walk.dir(), Some(WalkDir::Left));
+        // Sustained rightward travel eventually flips to Right.
+        let mut flipped = None;
+        for _ in 0..15 {
+            x += 4;
+            if let Some(d) = walk.update(x) {
+                flipped = Some(d);
+            }
+        }
+        assert_eq!(flipped, Some(WalkDir::Right));
     }
 }
