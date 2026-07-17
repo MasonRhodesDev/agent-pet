@@ -129,79 +129,81 @@ impl WalkDir {
     }
 }
 
-/// Decides the walk direction from the drag's *smoothed* horizontal
-/// velocity so hand jitter doesn't flip the sprite back and forth. Two
-/// layers of smoothing: an EMA of per-motion travel (with a dead zone), and
-/// a confirmation debounce — the opposite direction must persist for several
-/// consecutive samples before the sprite actually flips, so a single-frame
-/// outlier (a fast twitch) can never cause a flip.
+/// Decides the walk direction from the drag's *smoothed* horizontal velocity
+/// so hand jitter doesn't flip the sprite back and forth. Everything is
+/// TIME-based, not sample-based, so it behaves identically whether the mouse
+/// polls at 125 Hz or 1000 Hz: the velocity is a time-constant EMA of px/sec,
+/// and a candidate reversal must hold for a wall-clock duration before the
+/// sprite flips. A fast twitch (dozens of samples in a few ms) can't flip it.
 #[derive(Debug, Clone, Copy)]
 pub struct Walk {
     last_x: i32,
-    /// EMA of horizontal travel per motion (px), signed.
+    last_ms: u64,
+    /// Smoothed horizontal velocity, px/sec, signed.
     vel: f64,
     dir: Option<WalkDir>,
-    /// Candidate direction awaiting confirmation, and how many consecutive
-    /// samples have favored it.
+    /// Candidate reversal awaiting confirmation, and when it first appeared.
     pending: Option<WalkDir>,
-    pending_count: u32,
+    pending_since_ms: u64,
 }
 
-/// EMA weight of the newest sample. Lower = smoother / more history.
-const VEL_ALPHA: f64 = 0.15;
-/// Smoothed velocity magnitude needed to favor a direction. Between −FLIP and
-/// +FLIP the current direction is kept (dead zone).
-const VEL_FLIP: f64 = 1.0;
-/// Consecutive samples the opposite direction must hold before the sprite
-/// flips. Kills single-frame flips from an outlier sample.
-const CONFIRM_SAMPLES: u32 = 4;
+/// Velocity-smoothing time constant (ms). Larger = smoother / more lag.
+const TAU_MS: f64 = 140.0;
+/// Smoothed |velocity| (px/sec) needed to favor a direction; below this the
+/// current direction holds (dead zone around a near-stationary pointer).
+const FLIP_PX_S: f64 = 50.0;
+/// Wall-clock time a reversal must hold before the sprite flips.
+const CONFIRM_MS: u64 = 90;
 
 impl Walk {
     pub fn new(start_x: i32) -> Self {
         Self {
             last_x: start_x,
+            last_ms: 0,
             vel: 0.0,
             dir: None,
             pending: None,
-            pending_count: 0,
+            pending_since_ms: 0,
         }
     }
 
-    /// Feed the current mascot x. Returns `Some(dir)` only when the confirmed
-    /// direction actually changes, so the caller can switch the looping walk
-    /// track without restarting it every frame.
-    pub fn update(&mut self, x: i32) -> Option<WalkDir> {
-        let dx = (x - self.last_x) as f64;
+    /// Feed the current mascot x at time `now_ms`. Returns `Some(dir)` only
+    /// when the confirmed direction actually changes.
+    pub fn update(&mut self, x: i32, now_ms: u64) -> Option<WalkDir> {
+        let dt = now_ms.saturating_sub(self.last_ms);
+        if dt == 0 {
+            return None; // same-ms sample: nothing to integrate
+        }
+        let inst = (x - self.last_x) as f64 / dt as f64 * 1000.0; // px/sec
         self.last_x = x;
-        self.vel = VEL_ALPHA * dx + (1.0 - VEL_ALPHA) * self.vel;
+        self.last_ms = now_ms;
+        // Time-constant EMA: weight of the new sample depends on elapsed time,
+        // so smoothing is poll-rate independent.
+        let alpha = 1.0 - (-(dt as f64) / TAU_MS).exp();
+        self.vel = alpha * inst + (1.0 - alpha) * self.vel;
 
-        // Instantaneous candidate from the smoothed velocity.
-        let candidate = if self.vel >= VEL_FLIP {
+        let candidate = if self.vel >= FLIP_PX_S {
             Some(WalkDir::Right)
-        } else if self.vel <= -VEL_FLIP {
+        } else if self.vel <= -FLIP_PX_S {
             Some(WalkDir::Left)
         } else {
             None // dead zone
         };
 
-        // No candidate, or already walking that way: reset the pending flip.
+        // No candidate, or already walking that way: cancel any pending flip.
         if candidate.is_none() || candidate == self.dir {
             self.pending = None;
-            self.pending_count = 0;
             return None;
         }
-
-        // A candidate opposite the current direction must persist to flip.
-        if self.pending == candidate {
-            self.pending_count += 1;
-        } else {
+        // A reversal must hold CONFIRM_MS of wall-clock before it flips.
+        if self.pending != candidate {
             self.pending = candidate;
-            self.pending_count = 1;
+            self.pending_since_ms = now_ms;
+            return None;
         }
-        if self.pending_count >= CONFIRM_SAMPLES {
+        if now_ms.saturating_sub(self.pending_since_ms) >= CONFIRM_MS {
             self.dir = candidate;
             self.pending = None;
-            self.pending_count = 0;
             candidate
         } else {
             None
@@ -212,7 +214,7 @@ impl Walk {
         self.dir
     }
 
-    /// Smoothed horizontal velocity (px/motion, signed) — for drag telemetry.
+    /// Smoothed horizontal velocity (px/sec, signed) — for drag telemetry.
     pub fn vel(&self) -> f64 {
         self.vel
     }
@@ -302,62 +304,67 @@ mod tests {
         assert_eq!(drag, Drag::Idle);
     }
 
-    #[test]
-    fn walk_commits_a_direction_and_holds_it() {
-        let mut walk = Walk::new(0);
-        // Steady rightward travel commits Right, then holds (no re-fire).
-        let mut x = 0;
+    /// Drive `walk` with steady travel of `step` px every `dt_ms` for
+    /// `duration_ms`, returning the last direction it flipped to (if any).
+    fn drive(walk: &mut Walk, x: &mut i32, step: i32, dt_ms: u64, duration_ms: u64, t: &mut u64) -> Option<WalkDir> {
         let mut fired = None;
-        for _ in 0..10 {
-            x += 4;
-            if let Some(d) = walk.update(x) {
+        let end = *t + duration_ms;
+        while *t < end {
+            *t += dt_ms;
+            *x += step;
+            if let Some(d) = walk.update(*x, *t) {
                 fired = Some(d);
             }
         }
-        assert_eq!(fired, Some(WalkDir::Right));
+        fired
+    }
+
+    #[test]
+    fn walk_commits_a_direction_and_holds_it() {
+        let mut walk = Walk::new(0);
+        let (mut x, mut t) = (0, 0);
+        // Steady rightward travel (~2000 px/s) for 300ms commits Right.
+        assert_eq!(drive(&mut walk, &mut x, 2, 1, 300, &mut t), Some(WalkDir::Right));
         assert_eq!(walk.dir(), Some(WalkDir::Right));
     }
 
     #[test]
-    fn walk_ignores_jitter_against_the_overall_direction() {
+    fn walk_ignores_a_fast_twitch_at_high_poll_rate() {
+        // The exact bug from the logs: 1000Hz mouse, a ~24ms rightward twitch
+        // during an overall-left drag must NOT flip the sprite.
         let mut walk = Walk::new(0);
-        // Establish leftward motion.
-        let mut x = 0;
-        for _ in 0..10 {
-            x -= 4;
-            walk.update(x);
-        }
+        let (mut x, mut t) = (0, 0);
+        drive(&mut walk, &mut x, -3, 1, 300, &mut t); // establish Left @1000Hz
         assert_eq!(walk.dir(), Some(WalkDir::Left));
-        // A few small rightward jitters while still moving left overall must
-        // NOT flip the direction.
-        for step in [3, -5, 2, -6, 1, -4] {
-            x += step;
-            let flipped = walk.update(x);
-            assert!(
-                flipped != Some(WalkDir::Right),
-                "jitter flipped to Right at x={x}"
-            );
-        }
+        // 24ms of fast rightward samples (well under CONFIRM_MS).
+        let flipped = drive(&mut walk, &mut x, 4, 1, 24, &mut t);
+        assert_ne!(flipped, Some(WalkDir::Right), "a 24ms twitch flipped it");
         assert_eq!(walk.dir(), Some(WalkDir::Left));
     }
 
     #[test]
     fn walk_flips_on_a_sustained_reversal() {
         let mut walk = Walk::new(0);
-        let mut x = 0;
-        for _ in 0..10 {
-            x -= 4;
-            walk.update(x);
-        }
+        let (mut x, mut t) = (0, 0);
+        drive(&mut walk, &mut x, -3, 1, 300, &mut t);
         assert_eq!(walk.dir(), Some(WalkDir::Left));
-        // Sustained rightward travel eventually flips to Right.
-        let mut flipped = None;
-        for _ in 0..15 {
-            x += 4;
-            if let Some(d) = walk.update(x) {
-                flipped = Some(d);
-            }
+        // A real, sustained (>CONFIRM_MS) rightward reversal flips to Right.
+        assert_eq!(drive(&mut walk, &mut x, 3, 1, 300, &mut t), Some(WalkDir::Right));
+    }
+
+    #[test]
+    fn walk_is_poll_rate_independent() {
+        // Same real motion (2 px/ms rightward for 300ms) at 125Hz and 1000Hz
+        // both commit Right in comparable wall-clock — smoothing is time-based.
+        for dt in [1u64, 8] {
+            let mut walk = Walk::new(0);
+            let (mut x, mut t) = (0, 0);
+            let step = (2 * dt) as i32; // keep px/ms constant across rates
+            assert_eq!(
+                drive(&mut walk, &mut x, step, dt, 300, &mut t),
+                Some(WalkDir::Right),
+                "dt={dt}"
+            );
         }
-        assert_eq!(flipped, Some(WalkDir::Right));
     }
 }

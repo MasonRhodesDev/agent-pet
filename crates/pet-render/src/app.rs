@@ -610,11 +610,11 @@ impl App {
         self.position.margin_x = mx;
         self.position.margin_y = my;
         self.mascot.apply_margins(&self.position); // no relayout: quadrant frozen
+        let now = self.now_ms();
         if let Some(walk) = self.walk.as_mut() {
-            let flip = walk.update(mx);
-            if let Some(dir) = flip {
+            if let Some(dir) = walk.update(mx, now) {
                 debug!(?dir, vel = walk.vel(), mx, "walk flip");
-                self.timeline.request_loop(dir.track(), self.now_ms());
+                self.timeline.request_loop(dir.track(), now);
             }
         }
         // Render (draw the sprite + commit both the pending margin and buffer).
