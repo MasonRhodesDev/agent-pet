@@ -13,4 +13,4 @@ pub mod reduce;
 pub use expiry::Ttls;
 pub use fsm::step;
 pub use model::{Effect, Input, Model, Origin, SessionFsm};
-pub use reduce::{next_deadline, reduce};
+pub use reduce::{next_deadline, reduce, READY_PRESENT_MS};

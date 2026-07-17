@@ -148,3 +148,54 @@ fn focus_survives_a_wrapper_gone_for_a_different_session() {
     assert_eq!(model.focused, Some(key(Source::Claude, "a")));
 }
 
+
+// --- ready presentation window (mascot calms after 4s, stays in tray) ---
+
+#[test]
+fn ready_drives_mascot_only_within_presentation_window() {
+    use pet_core::READY_PRESENT_MS;
+    let mut model = Model::default();
+    // ready enters at t=0.
+    let mut e = ev(Source::Claude, "a", Ready);
+    e.ts = Some(0);
+    e.body = Some("done".into());
+    step(&mut model, Input::Event(e), 0);
+
+    // Within the window: ready drives the mascot.
+    assert_eq!(reduce(&model, 1_000).top, Ready);
+    assert_eq!(reduce(&model, READY_PRESENT_MS - 1).top, Ready);
+
+    // Past the window: mascot calms to idle, but the session stays listed and
+    // still counts as unread.
+    let snap = reduce(&model, READY_PRESENT_MS);
+    assert_eq!(snap.top, Idle, "ready calms after its presentation window");
+    assert_eq!(snap.sessions.len(), 1, "still in the tray");
+    assert_eq!(snap.unread, 1, "still unread until seen");
+}
+
+#[test]
+fn presented_out_ready_yields_to_a_fresh_running() {
+    use pet_core::READY_PRESENT_MS;
+    let mut model = Model::default();
+    let mut r = ev(Source::Claude, "a", Ready);
+    r.ts = Some(0);
+    step(&mut model, Input::Event(r), 0);
+    // Another session starts running later.
+    let mut run = ev(Source::Codex, "b", Running);
+    run.ts = Some(READY_PRESENT_MS);
+    step(&mut model, Input::Event(run), READY_PRESENT_MS);
+    // Past the ready window, running drives the mascot (ready has calmed).
+    assert_eq!(reduce(&model, READY_PRESENT_MS).top, Running);
+}
+
+#[test]
+fn next_deadline_includes_ready_presentation_end() {
+    use pet_core::{next_deadline, READY_PRESENT_MS};
+    let mut model = Model::default();
+    let mut e = ev(Source::Claude, "a", Ready);
+    e.ts = Some(0);
+    step(&mut model, Input::Event(e), 0);
+    // The presentation end (0 + 4s) is sooner than the 7-day ready expiry, so
+    // it's what the timer should fire on.
+    assert_eq!(next_deadline(&model), Some(READY_PRESENT_MS));
+}

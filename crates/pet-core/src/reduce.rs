@@ -4,6 +4,11 @@ use pet_proto::{AgentState, SessionView, Snapshot};
 
 use crate::model::Model;
 
+/// How long a non-blocking `ready` result actively drives the mascot/bubble
+/// before it calms (staying in the tray, still unread). Blocking states
+/// (needs-input / blocked) are NOT time-limited — they nag until acted on.
+pub const READY_PRESENT_MS: i64 = 4_000;
+
 /// Mascot/tray priority. Higher = more attention-worthy. Seen Ready/Failed
 /// no longer drive the mascot (the user has acknowledged them).
 fn priority(state: AgentState, seen: bool) -> u8 {
@@ -15,6 +20,12 @@ fn priority(state: AgentState, seen: bool) -> u8 {
         (AgentState::Failed, true) | (AgentState::Ready, true) => 1,
         (AgentState::Idle | AgentState::Gone, _) => 0,
     }
+}
+
+/// A `ready` session only drives the mascot within its presentation window:
+/// after that it has "been said" and calms, without being marked seen.
+fn presented_out(view: &SessionView, now_ms: i64) -> bool {
+    view.state == AgentState::Ready && now_ms - view.since >= READY_PRESENT_MS
 }
 
 pub fn reduce(model: &Model, now_ms: i64) -> Snapshot {
@@ -41,11 +52,11 @@ pub fn reduce(model: &Model, now_ms: i64) -> Snapshot {
             .then(b.since.cmp(&a.since))
     });
 
-    // The focused session stays listed in the tray but does not drive the
-    // mascot: you are already looking at it.
+    // A session drives the mascot only if it's not focused (you're looking at
+    // it) and not a ready result past its presentation window (already said).
     let top = sessions
         .iter()
-        .filter(|s| !s.focused)
+        .filter(|s| !s.focused && !presented_out(s, now_ms))
         .map(|s| (priority(s.state, s.seen), s.state))
         .max_by_key(|(p, _)| *p)
         .filter(|(p, _)| *p >= 2)
@@ -67,8 +78,16 @@ pub fn reduce(model: &Model, now_ms: i64) -> Snapshot {
     }
 }
 
-/// Earliest pending expiry across all sessions; the shell arms its timer to
-/// this instant.
+/// Earliest instant the reduced snapshot could change on its own: a session
+/// expiry, or the end of a `ready` session's presentation window (when the
+/// mascot calms). The shell arms its timer to this so the mascot calms on
+/// time, not only on the next event.
 pub fn next_deadline(model: &Model) -> Option<i64> {
-    model.sessions.values().map(|s| s.deadline).min()
+    let expiries = model.sessions.values().map(|s| s.deadline);
+    let present_ends = model
+        .sessions
+        .values()
+        .filter(|s| s.phase == AgentState::Ready)
+        .map(|s| s.since + READY_PRESENT_MS);
+    expiries.chain(present_ends).min()
 }

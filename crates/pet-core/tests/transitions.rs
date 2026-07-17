@@ -92,9 +92,16 @@ fn every_state_entry_arms_its_ttl_deadline() {
         let mut model = Model::default();
         let effects = step(&mut model, Input::Event(ev_at(state, 1_000)), 1_000);
         assert_eq!(model.sessions[&key()].deadline, 1_000 + ttl, "{state:?}");
+        // Ready's next tick is its (sooner) presentation-window end, not the
+        // 7-day expiry; every other state ticks on its expiry.
+        let expected = if state == Ready {
+            1_000 + pet_core::READY_PRESENT_MS
+        } else {
+            1_000 + ttl
+        };
         assert!(
-            effects.contains(&Effect::ScheduleTick(1_000 + ttl)),
-            "{state:?} should schedule its expiry tick, got {effects:?}"
+            effects.contains(&Effect::ScheduleTick(expected)),
+            "{state:?} should schedule a tick at {expected}, got {effects:?}"
         );
     }
 }
