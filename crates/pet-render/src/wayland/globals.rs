@@ -87,9 +87,8 @@ impl CompositorHandler for App {
         _surface: &wl_surface::WlSurface,
         _time: u32,
     ) {
-        // Animation is timer-driven at sprite cadence; frame callbacks are
-        // only requested by the drag render loop.
-        self.on_frame_callback();
+        // Animation is timer-driven at sprite cadence; nothing to do on a
+        // frame callback (the drag moves the surface directly per motion).
     }
 
     fn surface_enter(

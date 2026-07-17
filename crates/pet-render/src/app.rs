@@ -41,7 +41,7 @@ use crate::sprite::semantics;
 use crate::sprite::sheet::Sheet;
 use crate::sprite::timeline::Timeline;
 use crate::surface::bubble::AlertBubble;
-use crate::surface::mascot::{Mascot, SurfaceMode, EDGE_MARGIN};
+use crate::surface::mascot::{Mascot, EDGE_MARGIN};
 use crate::surface::position::Position;
 use crate::surface::visibility::Visibility;
 use crate::text::TextRenderer;
@@ -67,11 +67,6 @@ pub struct App {
     pub position_path: PathBuf,
     pub drag: Drag,
     pub clicks: Clicks,
-    /// A drag render is scheduled on the next compositor frame callback
-    /// (throttles the large full-output buffer to the refresh rate).
-    pub drag_frame_pending: bool,
-    /// The drag position changed since the last drag render.
-    pub drag_dirty: bool,
     /// Horizontal-travel tracker: drives the walk animation while dragging.
     pub walk: Option<Walk>,
     /// True while the pointer hovers the sprite and the jump gesture is up.
@@ -169,8 +164,6 @@ pub fn run(
         position_path,
         drag: Drag::Idle,
         clicks: Clicks::default(),
-        drag_frame_pending: false,
-        drag_dirty: false,
         walk: None,
         hovering: false,
         pointer: None,
@@ -382,10 +375,9 @@ impl App {
     /// state. Pure edge logic in `router::hover_transition`; only touches the
     /// animation, never the input routing (click/drag/right-click unaffected).
     pub(crate) fn set_hover(&mut self, over_sprite: bool) {
-        let docked = self.mascot.mode == SurfaceMode::Docked;
         let change = router::hover_transition(
             over_sprite,
-            docked,
+            !self.drag.dragging(), // "docked" for hover purposes = not dragging
             self.drag.dragging(),
             self.track_has_art("jumping"),
             &mut self.hovering,
@@ -417,34 +409,22 @@ impl App {
     }
 
     pub(crate) fn render_frame(&mut self) {
-        if !self.mascot.configured || !self.mascot.visibility.shown() || self.mascot.resizing {
+        if !self.mascot.configured || !self.mascot.visibility.shown() {
             return;
         }
         let now = self.now_ms();
         self.timeline.advance(now);
 
-        let dragging = self.mascot.mode == SurfaceMode::Drag;
+        // The pet is always a small docked surface; the sprite sits at the
+        // layout-quadrant offset within it, and the surface itself moves (via
+        // margins) to follow the cursor during a drag.
+        let dragging = self.drag.dragging();
         if !dragging && self.alert.visible().is_some() && self.text.is_none() {
             self.text = Some(TextRenderer::new());
         }
 
         let (surf_w, surf_h) = self.mascot.surface_size();
-        // In Drag mode the sprite sits at the (clamped) drag position within
-        // the stationary full-output surface; in Docked mode it is the
-        // layout-quadrant offset.
-        let (mascot_x, mascot_y) = if dragging {
-            let (dw, dh) = self.mascot.drag_dims;
-            let pos = self
-                .drag
-                .drag_pos()
-                .unwrap_or((self.position.margin_x, self.position.margin_y));
-            (
-                pos.0.clamp(0, (dw as i32 - self.mascot.mascot_w as i32).max(0)) as u32,
-                pos.1.clamp(0, (dh as i32 - self.mascot.mascot_h as i32).max(0)) as u32,
-            )
-        } else {
-            (self.mascot.mascot_x, self.mascot.mascot_y)
-        };
+        let (mascot_x, mascot_y) = (self.mascot.mascot_x, self.mascot.mascot_y);
 
         let geo = Geometry {
             surf_w,
@@ -590,10 +570,10 @@ impl App {
     }
 
     /// Recompute quadrant layout, margins, and input region from `position`.
-    /// A no-op while the surface is in Drag mode (the full-output surface owns
-    /// its own anchors/margins/region).
+    /// Skipped mid-drag: the drag moves margins directly and freezes the
+    /// quadrant so the sprite offset doesn't jump.
     pub(crate) fn sync_layout(&mut self) {
-        if self.mascot.mode == SurfaceMode::Drag {
+        if self.drag.dragging() {
             return;
         }
         self.mascot.relayout(&self.position);
@@ -606,132 +586,61 @@ impl App {
         }
     }
 
-    /// Threshold crossed: expand to the stationary full-output surface. The
-    /// sprite holds its docked position until that surface configures and the
-    /// first full-output motion establishes the grab — no jump, no feedback.
-    /// Threshold crossed: the drag FSM is now `Dragging` but NOT armed. Expand
-    /// to the stationary full-output surface; the FSM is armed (allowed to
-    /// establish grab) only when that surface's configure is acked, so no
-    /// docked-local motion can seed the drag. See input/drag.rs.
+    /// Threshold crossed: start following the cursor. The mascot stays its
+    /// small docked surface — Wayland's implicit pointer grab keeps motion
+    /// events flowing even off the surface, so no expansion is needed and
+    /// there is no coordinate-space transition to get wrong. The quadrant
+    /// layout is frozen for the drag so the sprite offset within the surface
+    /// stays fixed (only the margins move).
     pub(crate) fn begin_drag(&mut self) {
-        self.drag_frame_pending = false;
-        self.drag_dirty = false;
         self.hovering = false; // hover-jump is docked-only; clean slate
-
         // Only walk if the pet has directional walk art (both rows); the
-        // default pet's rows 1-2 are blank, so it slides on its base track.
+        // default pet's rows 1-2 are blank, so it just slides.
         self.walk = (self.track_has_art("running-right") && self.track_has_art("running-left"))
             .then(|| Walk::new(self.position.margin_x));
-        // The drag surface must be the full output so surface-local pointer
-        // coords equal output coords and the sprite can range across it.
-        let dims = self
-            .output_logical()
-            .map(|(w, h)| (w as u32, h as u32))
-            .unwrap_or((self.mascot.surf_w, self.mascot.surf_h));
-        info!(dims_w = dims.0, dims_h = dims.1, "begin drag (awaiting arm)");
-        if let Err(e) = self.mascot.enter_drag(&self.compositor_state, dims) {
-            warn!("enter drag surface failed: {e:#}");
-            self.walk = None;
-            self.drag.release();
-        }
     }
 
-    /// The full-output drag surface's resize configure was acked (its buffer
-    /// committed): pointer coords are now output-absolute. Arm the FSM so the
-    /// next motion may establish grab.
-    pub(crate) fn arm_drag(&mut self) {
-        self.drag.arm();
-        debug!("drag armed: full-output surface live");
-    }
-
-    /// A drag motion in full-output (== output) coords. Records the target,
-    /// updates the walk direction (transientState overrides the base state),
-    /// and schedules a frame-rate-limited render.
+    /// A drag motion in the docked surface's local coords (which run off the
+    /// surface bounds under the implicit grab). Moves the pet to keep the
+    /// grab point under the cursor.
     pub(crate) fn on_drag_motion(&mut self, pointer: (f64, f64)) {
-        if !self.drag.armed() {
-            // Dropped pre-arm motion (surface not yet confirmed full-output).
-            debug!(ptr_x = pointer.0, ptr_y = pointer.1, "drag motion dropped (pre-arm)");
-        }
-        let Some((x, y)) = self.drag.drag_to(pointer) else {
+        let Some((mx, my)) = self.drag.drag_to(pointer) else {
             return;
         };
-        // Captured AFTER drag_to so `grab` shows the established value. It must
-        // be output-absolute (~thousands), never docked-local (~0-280).
-        let (grab, start) = self.drag.debug_grab_start();
-        debug!(
-            ptr_x = pointer.0,
-            ptr_y = pointer.1,
-            grab_x = grab.map(|g| g.0),
-            grab_y = grab.map(|g| g.1),
-            start_x = start.map(|s| s.0),
-            start_y = start.map(|s| s.1),
-            pos_x = x,
-            pos_y = y,
-            dims_w = self.mascot.drag_dims.0,
-            dims_h = self.mascot.drag_dims.1,
-            "drag motion"
-        );
-        if let Some(dir) = self.walk.as_mut().and_then(|w| w.update(x)) {
+        debug!(ptr_x = pointer.0, ptr_y = pointer.1, mx, my, "drag motion");
+        self.position.margin_x = mx;
+        self.position.margin_y = my;
+        self.mascot.apply_margins(&self.position); // no relayout: quadrant frozen
+        if let Some(dir) = self.walk.as_mut().and_then(|w| w.update(mx)) {
             self.timeline.request_loop(dir.track(), self.now_ms());
         }
-        if self.drag_frame_pending {
-            self.drag_dirty = true;
-        } else {
-            self.drag_render();
-        }
-    }
-
-    /// Render one drag frame and arm a frame callback for the next, so the
-    /// large full-output buffer commits at most once per compositor frame.
-    fn drag_render(&mut self) {
-        if let Some((x, y)) = self.drag.drag_pos() {
-            debug!(x, y, "drag apply");
-        }
-        let surface = self.mascot.layer.wl_surface();
-        surface.frame(&self.qh, surface.clone());
-        self.drag_frame_pending = true;
-        self.drag_dirty = false;
+        // Render (draw the sprite + commit both the pending margin and buffer).
         self.render_frame();
     }
 
-    /// Compositor frame callback during a drag: render the latest position if
-    /// it moved, which re-arms only while motion continues.
-    pub(crate) fn on_frame_callback(&mut self) {
-        if !self.drag_frame_pending {
-            return;
-        }
-        self.drag_frame_pending = false;
-        if self.drag.dragging() && self.drag_dirty {
-            self.drag_render();
-        }
-    }
-
-    /// Drag finished: take the final on-screen position, clamp it on-screen,
-    /// shrink back to the docked surface, persist. Rendering (with the bubble
-    /// restored) resumes on the docked configure.
-    pub(crate) fn drag_drop(&mut self, final_position: Option<(i32, i32)>) {
-        let (dw, dh) = self.mascot.drag_dims;
-        if let Some((x, y)) = final_position {
-            self.position.margin_x = x;
-            self.position.margin_y = y;
-        }
+    /// Drag finished: clamp on-screen, re-pick the layout quadrant for the
+    /// resting position, persist.
+    pub(crate) fn drag_drop(&mut self) {
+        let (ow, oh) = self
+            .output_logical()
+            .unwrap_or((self.mascot.surf_w as i32, self.mascot.surf_h as i32));
         self.position.clamp(
-            dw as i32,
-            dh as i32,
+            ow,
+            oh,
             self.mascot.mascot_w as i32,
             self.mascot.mascot_h as i32,
         );
         self.position.output_name = self.output_name();
-        self.drag_frame_pending = false;
-        self.drag_dirty = false;
-        // Stop walking and return to the base state (restored from last_state,
-        // which kept updating from snapshots during the drag).
+        // Stop walking, return to the base state (kept fresh from snapshots).
         self.walk = None;
         let base = semantics::track_for(self.last_state, &self.pet);
         self.timeline.request_state(base, self.now_ms());
-        if let Err(e) = self.mascot.exit_drag(&self.compositor_state, &self.position) {
-            warn!("exit drag surface failed: {e:#}");
+        self.mascot.relayout(&self.position);
+        self.mascot.apply_margins(&self.position);
+        if let Err(e) = self.mascot.update_input_region(&self.compositor_state) {
+            warn!("input region update failed: {e:#}");
         }
+        self.render_frame();
         self.position.save(&self.position_path);
         info!(x = self.position.margin_x, y = self.position.margin_y, "position saved");
     }

@@ -16,7 +16,6 @@ use tracing::{debug, info};
 use crate::app::App;
 use crate::input::drag::Release;
 use crate::input::router::{cursor_for, hit_test, Cursor, Hit};
-use crate::surface::mascot::SurfaceMode;
 
 const BTN_LEFT: u32 = 0x110;
 const BTN_RIGHT: u32 = 0x111;
@@ -98,16 +97,16 @@ impl PointerHandler for App {
                     self.cursor = Cursor::Default;
                 }
                 PointerEventKind::Motion { .. } => {
-                    if self.mascot.mode == SurfaceMode::Drag {
-                        // Feed every motion to the FSM; it DROPS pre-arm
-                        // motions internally (armed state), so no docked-local
-                        // coordinate can seed grab. No `resizing` check here.
+                    if self.drag.dragging() {
+                        // Implicit grab keeps these flowing off-surface; move
+                        // the pet to follow. One coordinate space throughout.
                         self.on_drag_motion(event.position);
                         self.set_cursor(Cursor::Grabbing);
                     } else if self.drag.threshold_crossed(event.position) {
-                        // Docked surface: cross the click-vs-drag threshold ->
-                        // expand to the full-output drag surface.
+                        // Cross the click-vs-drag threshold: start following,
+                        // and apply this first motion immediately.
                         self.begin_drag();
+                        self.on_drag_motion(event.position);
                         self.set_cursor(Cursor::Grabbing);
                     } else {
                         // Pure hover: jump when entering the sprite region.
@@ -139,10 +138,10 @@ impl PointerHandler for App {
                             }
                         }
                     }
-                    // Capture the final drag position before release clears it.
-                    let final_position = self.drag.drag_pos();
                     match self.drag.release() {
-                        Release::Dropped => self.drag_drop(final_position),
+                        // Position was already applied during motion; just
+                        // settle it (clamp, relayout, persist).
+                        Release::Dropped => self.drag_drop(),
                         // Sprite click-without-drag: nothing (tray later).
                         Release::Click | Release::None => {}
                     }

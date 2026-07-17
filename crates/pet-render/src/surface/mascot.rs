@@ -31,12 +31,6 @@ pub const EDGE_MARGIN: i32 = 24;
 /// it STATIONARY (anchored all four edges, margins 0) so `wl_pointer`'s
 /// surface-local coords equal output coords — the sprite is then drawn at an
 /// internal pixel offset with no coordinate feedback. See input/drag.rs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SurfaceMode {
-    Docked,
-    Drag,
-}
-
 pub struct Mascot {
     pub layer: LayerSurface,
     /// Logical sprite size (frame size x sprite scale).
@@ -59,13 +53,6 @@ pub struct Mascot {
     pub output_scale: i32,
     pub configured: bool,
     pub visibility: Visibility,
-    pub mode: SurfaceMode,
-    /// Awaiting the configure for a pending size change (Docked<->Drag);
-    /// rendering is suppressed until the surface size is acked so the buffer
-    /// always matches the committed surface size.
-    pub resizing: bool,
-    /// Full-output logical size while in Drag mode (from the drag configure).
-    pub drag_dims: (u32, u32),
     pub entered: Option<WlOutput>,
     /// Bubble box (logical surface coords) while shown: click target and
     /// input-region member.
@@ -112,9 +99,6 @@ impl Mascot {
             } else {
                 Visibility::Hidden
             },
-            mode: SurfaceMode::Docked,
-            resizing: false,
-            drag_dims: (surf_w, surf_h),
             entered: None,
             bubble_rect: None,
             input_region: None,
@@ -123,49 +107,10 @@ impl Mascot {
         Ok(mascot)
     }
 
-    /// Current logical surface size, mode-dependent.
+    /// Current logical surface size (always the docked size — the pet moves
+    /// via margins, it does not resize to drag).
     pub fn surface_size(&self) -> (u32, u32) {
-        match self.mode {
-            SurfaceMode::Docked => (self.surf_w, self.surf_h),
-            SurfaceMode::Drag => self.drag_dims,
-        }
-    }
-
-    /// Expand to a stationary full-output surface for dragging: anchor all
-    /// four edges at the output's *explicit logical size* (not size 0 — some
-    /// compositors report new_size (0,0) for size-0 anchored surfaces, which
-    /// would leave `drag_dims` at the tiny docked size and clamp the sprite
-    /// to a few px). Margins 0, whole-surface input region. The pointer can
-    /// never escape and surface-local coords == output logical coords.
-    pub fn enter_drag(&mut self, compositor: &CompositorState, dims: (u32, u32)) -> Result<()> {
-        self.mode = SurfaceMode::Drag;
-        self.resizing = true;
-        // Authoritative from the known output size, so the clamp range and
-        // the buffer are correct even before / regardless of the configure.
-        self.drag_dims = dims;
-        self.layer
-            .set_anchor(Anchor::TOP | Anchor::LEFT | Anchor::BOTTOM | Anchor::RIGHT);
-        self.layer.set_size(dims.0, dims.1);
-        self.layer.set_margin(0, 0, 0, 0);
-        self.layer.set_exclusive_zone(-1);
-        self.update_input_region(compositor)?;
-        self.layer.commit();
-        Ok(())
-    }
-
-    /// Shrink back to the docked mascot surface at `pos` (mascot top-left on
-    /// the output). Rendering resumes on the ensuing configure.
-    pub fn exit_drag(&mut self, compositor: &CompositorState, pos: &Position) -> Result<()> {
-        self.mode = SurfaceMode::Docked;
-        self.resizing = true;
-        self.relayout(pos);
-        self.layer.set_anchor(Anchor::TOP | Anchor::LEFT);
-        self.layer.set_size(self.surf_w, self.surf_h);
-        self.layer.set_exclusive_zone(-1);
-        self.apply_margins(pos);
-        self.update_input_region(compositor)?;
-        self.layer.commit();
-        Ok(())
+        (self.surf_w, self.surf_h)
     }
 
     /// Pick the layout quadrant so the surface margins stay non-negative
@@ -207,16 +152,8 @@ impl Mascot {
     /// whole surface, so the pointer can never leave the input region.
     pub fn update_input_region(&mut self, compositor: &CompositorState) -> Result<()> {
         let region = Region::new(compositor).context("create input region")?;
-        match self.mode {
-            SurfaceMode::Docked => {
-                for rect in router::input_rects(self.sprite_rect(), self.bubble_rect) {
-                    region.add(rect.x, rect.y, rect.w as i32, rect.h as i32);
-                }
-            }
-            SurfaceMode::Drag => {
-                let (w, h) = self.drag_dims;
-                region.add(0, 0, w as i32, h as i32);
-            }
+        for rect in router::input_rects(self.sprite_rect(), self.bubble_rect) {
+            region.add(rect.x, rect.y, rect.w as i32, rect.h as i32);
         }
         self.layer.set_input_region(Some(region.wl_region()));
         self.input_region = Some(region);
@@ -264,31 +201,7 @@ impl LayerShellHandler for App {
     ) {
         let first = !self.mascot.configured;
         self.mascot.configured = true;
-
-        // Drag mode: the surface is the full output (size from the
-        // compositor). Ack it and render the drag frame; never run the
-        // docked layout while expanded.
-        if self.mascot.mode == SurfaceMode::Drag {
-            let (w, h) = configure.new_size;
-            if w > 0 && h > 0 {
-                self.mascot.drag_dims = (w, h);
-            }
-            info!(
-                new_w = w,
-                new_h = h,
-                drag_w = self.mascot.drag_dims.0,
-                drag_h = self.mascot.drag_dims.1,
-                "drag surface configured"
-            );
-            self.mascot.resizing = false;
-            // Commit the full-output buffer (acks the resize), then arm the
-            // FSM: coords are now output-absolute, so motions may seed grab.
-            self.render_frame();
-            self.arm_drag();
-            return;
-        }
-
-        self.mascot.resizing = false;
+        let _ = configure;
         self.ensure_position();
         self.sync_layout();
         if first {
