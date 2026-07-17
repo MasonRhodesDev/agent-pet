@@ -11,6 +11,7 @@ mod focus_join;
 mod gastown;
 mod persist;
 mod runtime;
+mod summary;
 
 use anyhow::Context;
 use tracing::info;

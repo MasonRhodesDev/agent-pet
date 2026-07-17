@@ -30,6 +30,7 @@ pub fn reduce(model: &Model, now_ms: i64) -> Snapshot {
             via: s.via,
             focused: model.focused.as_ref() == Some(key),
             body: s.body.clone(),
+            subtitle: None, // decorated by the daemon (needs file I/O)
             meta: s.meta.clone(),
         })
         .collect();

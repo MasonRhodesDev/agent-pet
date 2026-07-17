@@ -33,6 +33,11 @@ pub struct SessionView {
     pub focused: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub body: Option<String>,
+    /// A coarse "what is this session about" tagline (from the local
+    /// pane-summarizer). Secondary to `body`; shown as a tray subtitle and
+    /// used as a last-resort bubble caption when `body` is empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subtitle: Option<String>,
     #[serde(default)]
     pub meta: Meta,
 }
@@ -88,6 +93,7 @@ mod tests {
                 via: None,
                 focused: true,
                 body: Some("Permission".into()),
+                subtitle: None,
                 meta: Meta::default(),
             }],
             unread: 1,

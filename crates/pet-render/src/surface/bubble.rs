@@ -250,6 +250,7 @@ mod tests {
             via: None,
             focused: false,
             body: body.map(String::from),
+            subtitle: None,
             meta: Meta::default(),
         }
     }

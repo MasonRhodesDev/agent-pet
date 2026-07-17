@@ -102,7 +102,9 @@ async fn execute(
     for effect in effects {
         match effect {
             Effect::PublishSnapshot => {
-                let snapshot = Arc::new(reduce(model, now_ms()));
+                let mut snapshot = reduce(model, now_ms());
+                crate::summary::decorate(&mut snapshot);
+                let snapshot = Arc::new(snapshot);
                 let json = serde_json::to_string(&*snapshot).unwrap_or_default();
                 let _ = snapshot_tx.send(snapshot);
                 if let Err(e) = PetBus::snapshot_changed(iface.signal_emitter(), &json).await {
