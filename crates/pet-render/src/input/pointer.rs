@@ -120,6 +120,13 @@ impl PointerHandler for App {
                             let _ = self.ui_tx.send(UiAction::FocusSession {
                                 key: bubble.key.clone(),
                             });
+                            // Optimistic: collapse the nag now rather than
+                            // waiting on the focus-suppression round-trip
+                            // (works for waiting alerts and focus-join misses
+                            // too). The mascot track is unchanged.
+                            if self.alert.dismiss_current() {
+                                self.render_frame();
+                            }
                         }
                     }
                     let final_position = self.drag.take_pending();

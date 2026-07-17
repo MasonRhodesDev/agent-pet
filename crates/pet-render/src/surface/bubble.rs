@@ -74,16 +74,23 @@ impl Bubble {
     }
 }
 
-/// Alert bubble state: what is shown, plus a reveal memory keyed purely on
-/// the content identity (session key, label, body). Anything that leaves
-/// that triple unchanged — animation track switches, snapshot heartbeats,
-/// seen-count noise, transient alert clears, hide/show round-trips — keeps
-/// the typewriter's progress; a changed triple re-types from zero.
+/// Alert bubble state: what is shown, a reveal memory keyed purely on the
+/// content identity (session key, label, body), and an optional dismissal
+/// on that same triple. Anything that leaves the triple unchanged —
+/// animation track switches, snapshot heartbeats, seen-count noise,
+/// transient alert clears, hide/show round-trips — keeps the typewriter's
+/// progress AND any dismissal; a changed triple re-types from zero and
+/// clears the dismissal.
 #[derive(Debug, Default)]
 pub struct AlertBubble {
     shown: bool,
     /// Most recent reveal (content + start time), kept while hidden.
     slot: Option<Bubble>,
+    /// Content triple the user optimistically dismissed by clicking. While
+    /// the top alert equals this, the bubble stays collapsed even though the
+    /// session is still `top` (e.g. a `waiting` alert that never changes
+    /// state on click, or a focus-join miss).
+    dismissed: Option<(SessionKey, &'static str, String)>,
 }
 
 impl AlertBubble {
@@ -96,10 +103,19 @@ impl AlertBubble {
                     b.key == key && b.label == label && b.body == body
                 });
                 if !same_content {
-                    self.slot = Some(Bubble::new(key, label, body.to_string(), now_ms));
+                    // Genuinely new/changed alert: fresh reveal, and the old
+                    // dismissal no longer applies.
+                    self.slot = Some(Bubble::new(key.clone(), label, body.to_string(), now_ms));
+                    self.dismissed = None;
                 }
-                let changed = !self.shown || !same_content;
-                self.shown = true;
+                // A dismissal only holds while the triple matches it exactly.
+                let dismissed = self
+                    .dismissed
+                    .as_ref()
+                    .is_some_and(|(dk, dl, db)| *dk == key && *dl == label && db == body);
+                let visible = !dismissed;
+                let changed = self.shown != visible || !same_content;
+                self.shown = visible;
                 changed
             }
             None => {
@@ -108,6 +124,18 @@ impl AlertBubble {
                 changed
             }
         }
+    }
+
+    /// The user clicked the bubble: optimistically collapse it now and keep
+    /// it collapsed while this exact alert content stays on top. Returns true
+    /// if a visible bubble was actually dismissed (redraw due).
+    pub fn dismiss_current(&mut self) -> bool {
+        let Some(bubble) = self.slot.as_ref().filter(|_| self.shown) else {
+            return false;
+        };
+        self.dismissed = Some((bubble.key.clone(), bubble.label, bubble.body.clone()));
+        self.shown = false;
+        true
     }
 
     pub fn visible(&self) -> Option<&Bubble> {
@@ -423,5 +451,98 @@ mod tests {
         assert_eq!(alert.visible().unwrap().visible_chars(300), 9); // done
         assert!(alert.apply(&failed, 300));
         assert_eq!(alert.visible().unwrap().visible_chars(300), 0);
+    }
+
+    #[test]
+    fn click_dismisses_current_triple_and_identical_snapshots_stay_hidden() {
+        let mut alert = AlertBubble::default();
+        // A `waiting` alert that never changes state on click.
+        let waiting = snap(
+            AgentState::Waiting,
+            vec![view(AgentState::Waiting, Some("Approve tool?"))],
+        );
+        assert!(alert.apply(&waiting, 0));
+        assert!(alert.visible().is_some());
+
+        // Click -> collapse immediately (redraw due).
+        assert!(alert.dismiss_current());
+        assert!(alert.visible().is_none());
+        // Dismissing again (nothing visible) is a no-op.
+        assert!(!alert.dismiss_current());
+
+        // Identical snapshot heartbeats keep it hidden and report no change.
+        assert!(!alert.apply(&waiting, 50));
+        assert!(alert.visible().is_none());
+        assert!(!alert.apply(&waiting, 999));
+        assert!(alert.visible().is_none());
+    }
+
+    #[test]
+    fn dismissal_lifts_when_the_alert_content_genuinely_changes() {
+        let mut alert = AlertBubble::default();
+        let waiting = snap(
+            AgentState::Waiting,
+            vec![view(AgentState::Waiting, Some("Approve tool?"))],
+        );
+        alert.apply(&waiting, 0);
+        alert.dismiss_current();
+        assert!(alert.visible().is_none());
+
+        // Same session, new body text -> new triple -> bubble returns, fresh.
+        let new_body = snap(
+            AgentState::Waiting,
+            vec![view(AgentState::Waiting, Some("Approve a DIFFERENT tool?"))],
+        );
+        assert!(alert.apply(&new_body, 100));
+        let b = alert.visible().expect("new content re-shows");
+        assert_eq!(b.visible_chars(100), 0); // types fresh
+
+        // Dismiss again, then the same session transitions state (new label).
+        alert.dismiss_current();
+        assert!(alert.visible().is_none());
+        let ready = snap(
+            AgentState::Ready,
+            vec![view(AgentState::Ready, Some("Approve a DIFFERENT tool?"))],
+        );
+        assert!(alert.apply(&ready, 200));
+        assert!(alert.visible().is_some()); // waiting->ready is new info
+    }
+
+    #[test]
+    fn dismissal_does_not_leak_across_sessions() {
+        let mut alert = AlertBubble::default();
+        alert.apply(
+            &snap(
+                AgentState::Waiting,
+                vec![view(AgentState::Waiting, Some("same text"))],
+            ),
+            0,
+        );
+        alert.dismiss_current();
+
+        // A DIFFERENT session with identical label+body is still new info.
+        let other = SessionView {
+            key: SessionKey::new(Source::Codex, "s2"),
+            ..view(AgentState::Waiting, Some("same text"))
+        };
+        assert!(alert.apply(&snap(AgentState::Waiting, vec![other]), 100));
+        assert!(alert.visible().is_some());
+    }
+
+    #[test]
+    fn a_returning_identical_alert_after_a_transient_clear_stays_dismissed() {
+        let mut alert = AlertBubble::default();
+        let waiting = snap(
+            AgentState::Waiting,
+            vec![view(AgentState::Waiting, Some("Approve tool?"))],
+        );
+        alert.apply(&waiting, 0);
+        alert.dismiss_current();
+
+        // Focus flickers away (running heartbeat) then the SAME waiting alert
+        // returns: it must remain dismissed (the triple is unchanged).
+        assert!(!alert.apply(&snap(AgentState::Running, vec![]), 50));
+        assert!(!alert.apply(&waiting, 100));
+        assert!(alert.visible().is_none());
     }
 }
