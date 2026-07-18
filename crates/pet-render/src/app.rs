@@ -700,6 +700,8 @@ impl App {
         self.mascot.unmap();
         self.position.visible = false;
         self.position.save(&self.position_path);
+        // A later `show` is a fresh reveal — let it greet again.
+        self.greeted = false;
         // The frame timer parks itself on its next tick.
     }
 
@@ -727,6 +729,15 @@ impl App {
     /// when the cursor is inside the deadzone (look straight ahead).
     fn on_cursor(&mut self, x: i32, y: i32) {
         if !self.gaze_wanted.load(Ordering::Relaxed) {
+            return;
+        }
+        // A gesture burst (the greeting wave, a hover jump) owns the sprite —
+        // don't mask it with a gaze frame. Let it finish; gaze resumes once
+        // the timeline settles back to idle.
+        if self.timeline.current_track() != "idle" {
+            if self.gaze.take().is_some() && self.mascot.visibility.shown() {
+                self.render_frame();
+            }
             return;
         }
         let (cx, cy) = self.pet_center_global();
