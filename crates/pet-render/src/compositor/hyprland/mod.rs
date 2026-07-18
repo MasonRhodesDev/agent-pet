@@ -4,6 +4,7 @@
 //! channel. Auto-reconnects socket2 with backoff. Never touches the
 //! renderer's Wayland connection or blocks the calloop dispatch.
 
+pub mod cursor;
 pub mod events;
 pub mod query;
 
@@ -15,7 +16,9 @@ use std::time::Duration;
 
 use tracing::{debug, info, warn};
 
-use crate::compositor::{ActiveWindowSource, CompositorBackend, SourceCtx};
+use crate::compositor::{
+    ActiveWindowSource, CompositorBackend, CursorCtx, CursorSource, SourceCtx,
+};
 
 pub struct Hyprland;
 
@@ -55,6 +58,10 @@ impl CompositorBackend for Hyprland {
             stop,
             handle: Some(handle),
         })
+    }
+
+    fn start_cursor_source(&self, ctx: CursorCtx) -> CursorSource {
+        CursorSource::Hyprland(cursor::start(ctx))
     }
 }
 

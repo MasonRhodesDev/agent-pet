@@ -38,13 +38,16 @@ pub(crate) fn scene(
     geo: &Geometry,
     sheet: &mut Sheet,
     timeline: &Timeline,
+    gaze: Option<usize>,
     bubble: Option<(&Bubble, &mut TextRenderer)>,
     now_ms: u64,
 ) -> Option<(i32, i32, u32, u32)> {
     let oscale = geo.oscale.max(1);
     let factor = geo.sprite_scale * oscale;
     let (buf_w, buf_h) = geo.buf_size();
-    let index = timeline.sprite_index();
+    // A gaze frame (cursor-follow) overrides the timeline's current frame; it
+    // is a static directional pose, not an animation.
+    let index = gaze.unwrap_or_else(|| timeline.sprite_index());
     // Anchor the bubble to the sprite's visible ink, not the frame rect:
     // sprites sit low inside padded frames, and the bubble must hug what
     // the eye sees. Track-wide extent so it does not jitter per frame.

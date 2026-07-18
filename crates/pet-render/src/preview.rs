@@ -62,6 +62,7 @@ pub fn render_scene(
         &geo,
         &mut sheet,
         &timeline,
+        None, // gaze is a live cursor-follow overlay; not part of static preview
         bubble.as_ref().map(|b| (b, &mut text)),
         elapsed_ms,
     );

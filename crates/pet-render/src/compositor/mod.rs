@@ -15,6 +15,9 @@ pub mod hyprland;
 pub mod settle;
 pub mod wlr_generic;
 
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
+
 use pet_proto::ActiveWindow;
 use smithay_client_toolkit::reexports::calloop::channel::Sender;
 use smithay_client_toolkit::reexports::client::globals::GlobalList;
@@ -24,6 +27,26 @@ use crate::app::App;
 
 /// Undebounced active-window facts flow to the renderer through this sink.
 pub type FactSink = Sender<Option<ActiveWindow>>;
+
+/// Global cursor positions (logical compositor coords) flow to the renderer
+/// through this sink, for cursor-follow gaze.
+pub type CursorSink = Sender<(i32, i32)>;
+
+/// What a backend needs to start a cursor source. `wanted` is the renderer's
+/// gate: the source only polls while it is true (gaze is idle+visible and the
+/// pointer isn't otherwise busy), so a still or hidden pet costs nothing.
+pub struct CursorCtx {
+    pub sink: CursorSink,
+    pub wanted: Arc<AtomicBool>,
+}
+
+/// Keeps a cursor source alive; dropping it tears the source down.
+pub enum CursorSource {
+    Hyprland(hyprland::cursor::Source),
+    /// No cursor tracking on this backend (wlr_generic today; GNOME/Plasma
+    /// until each implements it). Gaze simply never fires.
+    None,
+}
 
 /// Everything a backend might need to start its source: the Wayland globals
 /// and queue handle (wlr binds a protocol on the live connection) and the
@@ -50,6 +73,13 @@ pub trait CompositorBackend {
     /// Begin reporting the active toplevel into `ctx.sink`. Never blocks the
     /// caller; failures degrade to `ActiveWindowSource::None`.
     fn start_active_window_source(&self, ctx: SourceCtx) -> ActiveWindowSource;
+
+    /// Begin reporting the global cursor position into `ctx.sink` for gaze.
+    /// Default: unsupported — the pet just never gazes. Backends that can
+    /// (Hyprland via `cursorpos`) override this.
+    fn start_cursor_source(&self, _ctx: CursorCtx) -> CursorSource {
+        CursorSource::None
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -28,6 +28,22 @@ pub fn active_window() -> Result<Option<ActiveWindow>> {
     Ok(parse_active_window(&reply))
 }
 
+/// One `j/cursorpos` exchange → the global cursor position in logical
+/// (compositor) coordinates, or `None` if Hyprland can't report it.
+pub fn cursor_pos() -> Result<Option<(i32, i32)>> {
+    let path = socket1_path().context("not under Hyprland (no signature)")?;
+    let reply = request(&path, "j/cursorpos")?;
+    Ok(parse_cursorpos(&reply))
+}
+
+/// Parse a `j/cursorpos` reply (`{"x":N,"y":N}`) into a point. Pure.
+pub fn parse_cursorpos(json: &str) -> Option<(i32, i32)> {
+    let v: serde_json::Value = serde_json::from_str(json).ok()?;
+    let x = v.get("x")?.as_i64()?;
+    let y = v.get("y")?.as_i64()?;
+    Some((x as i32, y as i32))
+}
+
 fn request(path: &str, cmd: &str) -> Result<String> {
     let mut stream = UnixStream::connect(path).with_context(|| format!("connect {path}"))?;
     stream.set_read_timeout(Some(IO_TIMEOUT))?;
@@ -90,6 +106,14 @@ mod tests {
         assert_eq!(w.address.as_deref(), Some("0x5f3a1c0"));
         assert_eq!(w.app_id.as_deref(), Some("kitty"));
         assert_eq!(w.title.as_deref(), Some("claude — agent-pet"));
+    }
+
+    #[test]
+    fn parses_cursor_position() {
+        assert_eq!(parse_cursorpos(r#"{"x": 2400, "y": 316}"#), Some((2400, 316)));
+        assert_eq!(parse_cursorpos(r#"{"x": -12, "y": 0}"#), Some((-12, 0)));
+        assert_eq!(parse_cursorpos("{}"), None);
+        assert_eq!(parse_cursorpos("not json"), None);
     }
 
     #[test]

@@ -3,6 +3,7 @@
 //! the supervisor in lib.rs recreates everything with backoff).
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -33,7 +34,7 @@ use tracing::{debug, info, warn};
 use crate::compose::{self, Geometry};
 use crate::compositor::settle::{Action as SettleAction, Settle, DEFAULT_SETTLE_MS};
 use crate::compositor::wlr_generic::Wlr;
-use crate::compositor::{self, ActiveWindowSource, SourceCtx};
+use crate::compositor::{self, ActiveWindowSource, CursorCtx, CursorSource, SourceCtx};
 use crate::input::drag::{Drag, Walk};
 use crate::input::router::{self, Clicks, Cursor, HoverChange, Rect};
 use crate::sprite::pet_json::{resolve_pet_dir, PetDef};
@@ -97,6 +98,17 @@ pub struct App {
     pub wlr: Wlr,
     /// Keeps the active-window source alive for the run's lifetime.
     pub active_window_source: ActiveWindowSource,
+    /// Keeps the cursor-follow source alive (Hyprland poll thread; inert on
+    /// other backends).
+    pub cursor_source: CursorSource,
+    /// Shared gate telling the cursor source when to poll: true only while
+    /// gaze should run (v2 pet, visible, idle, pointer not busy).
+    pub gaze_wanted: Arc<AtomicBool>,
+    /// The pet has 16-direction gaze art (v2, rows 9-10).
+    pub gaze_capable: bool,
+    /// Current gaze override frame; `Some` while tracking the cursor, else the
+    /// timeline drives the sprite.
+    pub gaze: Option<usize>,
     pub shutdown: bool,
     pub error: Option<anyhow::Error>,
 }
@@ -146,6 +158,7 @@ pub fn run(
     let handle = event_loop.handle();
 
     let started = Instant::now();
+    let gaze_capable = pet.rows >= crate::sprite::pet_json::V2_ROWS;
     let mut app = App {
         registry_state: bound.registry_state,
         output_state: bound.output_state,
@@ -182,6 +195,10 @@ pub fn run(
         settle_token: None,
         wlr: Wlr::default(),
         active_window_source: ActiveWindowSource::None,
+        cursor_source: CursorSource::None,
+        gaze_wanted: Arc::new(AtomicBool::new(false)),
+        gaze_capable,
+        gaze: None,
         shutdown: false,
         error: None,
     };
@@ -196,7 +213,9 @@ pub fn run(
     handle
         .insert_source(snapshots, |event, _, app: &mut App| match event {
             channel::Event::Msg(snapshot) => {
-                if app.apply_snapshot(&snapshot) && app.mascot.visibility.shown() {
+                let changed = app.apply_snapshot(&snapshot);
+                app.update_gaze(); // state may have entered/left idle
+                if changed && app.mascot.visibility.shown() {
                     app.render_frame();
                     app.rearm_timer();
                 }
@@ -235,7 +254,26 @@ pub fn run(
         })
         .map_err(|e| anyhow!("insert active-window channel: {e}"))?;
 
+    // Cursor-follow gaze: the backend polls the global cursor (Hyprland
+    // cursorpos) into this channel while `gaze_wanted` is set. Only v2 pets
+    // have gaze art, so don't even start the source otherwise.
+    if app.gaze_capable {
+        let (cursor_tx, cursors) = channel::channel::<(i32, i32)>();
+        app.cursor_source = backend.start_cursor_source(CursorCtx {
+            sink: cursor_tx,
+            wanted: app.gaze_wanted.clone(),
+        });
+        handle
+            .insert_source(cursors, |event, _, app: &mut App| {
+                if let channel::Event::Msg((x, y)) = event {
+                    app.on_cursor(x, y);
+                }
+            })
+            .map_err(|e| anyhow!("insert cursor channel: {e}"))?;
+    }
+
     app.ensure_timer();
+    app.update_gaze();
 
     loop {
         event_loop
@@ -321,6 +359,7 @@ impl App {
             Some(ControlCmd::Hide) => self.hide(),
             None => {}
         }
+        self.update_gaze(); // visibility may have flipped
     }
 
     /// A raw active-window fact from the compositor backend. Runs it through
@@ -382,6 +421,7 @@ impl App {
             self.track_has_art("jumping"),
             &mut self.hovering,
         );
+        self.update_gaze(); // hovering owns the sprite; pause/resume gaze
         let track = match change {
             Some(HoverChange::Jump) => "jumping".to_string(),
             Some(HoverChange::ReturnToBase) => {
@@ -441,6 +481,7 @@ impl App {
         let oscale = geo.oscale as i32;
         let sheet = &mut self.sheet;
         let timeline = &self.timeline;
+        let gaze = self.gaze;
         // No bubble while dragging (repositioning, not reading); it returns
         // on drop when the docked surface is restored.
         let bubble = if dragging {
@@ -453,7 +494,7 @@ impl App {
             self.mascot.layer.wl_surface(),
             buf_w,
             buf_h,
-            |buf| compose::scene(buf, &geo, sheet, timeline, bubble, now),
+            |buf| compose::scene(buf, &geo, sheet, timeline, gaze, bubble, now),
         );
         let bubble_px = match result {
             Ok(px) => px,
@@ -598,6 +639,7 @@ impl App {
         // default pet's rows 1-2 are blank, so it just slides.
         self.walk = (self.track_has_art("running-right") && self.track_has_art("running-left"))
             .then(|| Walk::new(self.position.margin_x));
+        self.update_gaze(); // dragging owns the sprite; pause gaze
     }
 
     /// A drag motion in the docked surface's local coords (which run off the
@@ -644,6 +686,7 @@ impl App {
             warn!("input region update failed: {e:#}");
         }
         self.render_frame();
+        self.update_gaze(); // released; gaze may resume
         self.position.save(&self.position_path);
         info!(x = self.position.margin_x, y = self.position.margin_y, "position saved");
     }
@@ -676,6 +719,69 @@ impl App {
             self.ensure_timer();
         } else {
             self.mascot.request_remap(&self.position);
+        }
+    }
+
+    /// A cursor point (global logical coords) arrived from the backend. Turn
+    /// it into a gaze frame relative to the pet's centre, or clear the gaze
+    /// when the cursor is inside the deadzone (look straight ahead).
+    fn on_cursor(&mut self, x: i32, y: i32) {
+        if !self.gaze_wanted.load(Ordering::Relaxed) {
+            return;
+        }
+        let (cx, cy) = self.pet_center_global();
+        // Deadzone ≈ one sprite width: the cursor resting on the pet reads as
+        // "looking straight ahead" (idle), not a jittery near-centre stare.
+        let deadzone = self.mascot.mascot_w as f64;
+        let next = crate::sprite::gaze::gaze_index(
+            x as f64 - cx,
+            y as f64 - cy,
+            deadzone,
+            self.pet.columns as usize,
+        );
+        if next != self.gaze {
+            self.gaze = next;
+            if self.mascot.visibility.shown() {
+                self.render_frame();
+            }
+        }
+    }
+
+    /// The pet's on-screen centre in global logical coords, to match the
+    /// cursor's coordinate space. Portable: the output's logical position
+    /// comes from xdg-output (SCTK `OutputInfo`), not a Hyprland query.
+    fn pet_center_global(&self) -> (f64, f64) {
+        let (ox, oy) = self.output_logical_position();
+        let cx = ox + self.position.margin_x + self.mascot.mascot_w as i32 / 2;
+        let cy = oy + self.position.margin_y + self.mascot.mascot_h as i32 / 2;
+        (cx as f64, cy as f64)
+    }
+
+    fn output_logical_position(&self) -> (i32, i32) {
+        let info = match &self.mascot.entered {
+            Some(output) => self.output_state.info(output),
+            None => self
+                .output_state
+                .outputs()
+                .next()
+                .and_then(|o| self.output_state.info(&o)),
+        };
+        info.and_then(|i| i.logical_position).unwrap_or((0, 0))
+    }
+
+    /// Recompute whether the cursor source should be polling, flip the shared
+    /// gate, and drop any stale gaze when it turns off. Gaze runs only when
+    /// the pet is a v2 skin, visible, idle, and the pointer is neither
+    /// hovering nor dragging (those own the sprite).
+    pub(crate) fn update_gaze(&mut self) {
+        let wanted = self.gaze_capable
+            && self.mascot.visibility.shown()
+            && !self.hovering
+            && !self.drag.dragging()
+            && self.last_state == AgentState::Idle;
+        self.gaze_wanted.store(wanted, Ordering::Relaxed);
+        if !wanted && self.gaze.take().is_some() && self.mascot.visibility.shown() {
+            self.render_frame(); // restore the timeline frame
         }
     }
 
