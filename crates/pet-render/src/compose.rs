@@ -38,7 +38,7 @@ pub(crate) fn scene(
     geo: &Geometry,
     sheet: &mut Sheet,
     timeline: &Timeline,
-    gaze: Option<usize>,
+    gaze: Option<crate::sprite::gaze::GazeFrame>,
     bubble: Option<(&Bubble, &mut TextRenderer)>,
     now_ms: u64,
 ) -> Option<(i32, i32, u32, u32)> {
@@ -46,8 +46,10 @@ pub(crate) fn scene(
     let factor = geo.sprite_scale * oscale;
     let (buf_w, buf_h) = geo.buf_size();
     // A gaze frame (cursor-follow) overrides the timeline's current frame; it
-    // is a static directional pose, not an animation.
-    let index = gaze.unwrap_or_else(|| timeline.sprite_index());
+    // is a static directional pose, not an animation. Left-facing gaze reuses
+    // the right-facing cell mirrored (`flip_h`).
+    let index = gaze.map_or_else(|| timeline.sprite_index(), |g| g.index);
+    let flip_h = gaze.is_some_and(|g| g.flip_h);
     // Anchor the bubble to the sprite's visible ink, not the frame rect:
     // sprites sit low inside padded frames, and the bubble must hug what
     // the eye sees. Track-wide extent so it does not jitter per frame.
@@ -59,13 +61,12 @@ pub(crate) fn scene(
 
     let mut canvas = Canvas::new(buf, buf_w, buf_h);
     canvas.clear();
-    canvas.blit(
-        frame,
-        sprite_w,
-        sprite_h,
-        geo.mascot_x * oscale,
-        geo.mascot_y * oscale,
-    );
+    let (bx, by) = (geo.mascot_x * oscale, geo.mascot_y * oscale);
+    if flip_h {
+        canvas.blit_flipped_h(frame, sprite_w, sprite_h, bx, by);
+    } else {
+        canvas.blit(frame, sprite_w, sprite_h, bx, by);
+    }
     let (bubble, text) = bubble?;
     let sprite_y = (geo.mascot_y * oscale) as i32;
     let area = BubbleArea {

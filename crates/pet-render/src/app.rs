@@ -106,9 +106,9 @@ pub struct App {
     pub gaze_wanted: Arc<AtomicBool>,
     /// The pet has 16-direction gaze art (v2, rows 9-10).
     pub gaze_capable: bool,
-    /// Current gaze override frame; `Some` while tracking the cursor, else the
-    /// timeline drives the sprite.
-    pub gaze: Option<usize>,
+    /// Current gaze override frame (+ horizontal flip); `Some` while tracking
+    /// the cursor, else the timeline drives the sprite.
+    pub gaze: Option<crate::sprite::gaze::GazeFrame>,
     pub shutdown: bool,
     pub error: Option<anyhow::Error>,
 }
@@ -744,7 +744,7 @@ impl App {
         // Deadzone ≈ one sprite width: the cursor resting on the pet reads as
         // "looking straight ahead" (idle), not a jittery near-centre stare.
         let deadzone = self.mascot.mascot_w as f64;
-        let next = crate::sprite::gaze::gaze_index(
+        let next = crate::sprite::gaze::gaze_frame(
             x as f64 - cx,
             y as f64 - cy,
             deadzone,

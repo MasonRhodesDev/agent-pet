@@ -32,6 +32,26 @@ impl<'a> Canvas<'a> {
         }
     }
 
+    /// Like `blit`, but mirror the source horizontally (reverse each row's
+    /// pixels). Used for gaze frames whose left-facing directions reuse the
+    /// right-facing art flipped.
+    pub fn blit_flipped_h(&mut self, src: &[u8], src_w: u32, src_h: u32, x: u32, y: u32) {
+        if x + src_w > self.width || y + src_h > self.height {
+            return;
+        }
+        let sw = src_w as usize;
+        let row_bytes = sw * 4;
+        for sy in 0..src_h as usize {
+            let d = (((y as usize + sy) * self.width as usize) + x as usize) * 4;
+            let s = sy * row_bytes;
+            for sx in 0..sw {
+                let sp = s + (sw - 1 - sx) * 4;
+                let dp = d + sx * 4;
+                self.buf[dp..dp + 4].copy_from_slice(&src[sp..sp + 4]);
+            }
+        }
+    }
+
     /// Source-over blend of a straight-alpha color at the given coverage.
     pub fn blend(&mut self, x: i32, y: i32, color: Rgba, coverage: f32) {
         if x < 0 || y < 0 || x >= self.width as i32 || y >= self.height as i32 {
