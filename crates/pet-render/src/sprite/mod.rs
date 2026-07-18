@@ -1,3 +1,4 @@
+pub mod gaze;
 pub mod pet_json;
 pub mod semantics;
 pub mod sheet;
