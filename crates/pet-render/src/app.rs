@@ -37,7 +37,7 @@ use crate::compositor::wlr_generic::Wlr;
 use crate::compositor::{self, ActiveWindowSource, CursorCtx, CursorSource, SourceCtx};
 use crate::input::drag::{Drag, Walk};
 use crate::input::router::{self, Clicks, Cursor, HoverChange, Rect};
-use crate::sprite::pet_json::{resolve_pet_dir, PetDef};
+use crate::sprite::pet_json::{resolve_pet_dir_for, PetDef};
 use crate::sprite::semantics;
 use crate::sprite::sheet::Sheet;
 use crate::sprite::timeline::Timeline;
@@ -47,7 +47,7 @@ use crate::surface::position::Position;
 use crate::surface::visibility::Visibility;
 use crate::text::TextRenderer;
 use crate::wayland::{buffers, globals};
-use crate::{Control, ControlCmd};
+use crate::{Control, ControlCmd, PetSelection};
 
 pub struct App {
     pub registry_state: RegistryState,
@@ -117,8 +117,9 @@ pub fn run(
     snapshot_rx: watch::Receiver<Arc<Snapshot>>,
     control_rx: watch::Receiver<Control>,
     ui_tx: mpsc::UnboundedSender<UiAction>,
+    pet_rx: watch::Receiver<PetSelection>,
 ) -> Result<()> {
-    let pet_dir = resolve_pet_dir()?;
+    let pet_dir = resolve_pet_dir_for(pet_rx.borrow().skin.as_deref())?;
     let pet = PetDef::load(&pet_dir)?;
     let sheet = Sheet::load(&pet)?;
     info!(pet = %pet.id, dir = %pet_dir.display(), backend = ?compositor::detect(), "pet loaded");
@@ -148,11 +149,8 @@ pub fn run(
         sprite_scale,
         position.visible,
     )?;
-    let pool = SlotPool::new(
-        (mascot.surf_w * mascot.surf_h * 4 * 2) as usize,
-        &bound.shm,
-    )
-    .context("create shm pool")?;
+    let pool = SlotPool::new((mascot.surf_w * mascot.surf_h * 4 * 2) as usize, &bound.shm)
+        .context("create shm pool")?;
 
     let mut event_loop = EventLoop::<'static, App>::try_new().context("create event loop")?;
     let handle = event_loop.handle();
@@ -232,6 +230,16 @@ pub fn run(
             channel::Event::Closed => app.shutdown = true,
         })
         .map_err(|e| anyhow!("insert control channel: {e}"))?;
+
+    let (pet_tx, pets) = channel::channel::<PetSelection>();
+    spawn_bridge("pet-render-pet", pet_rx, pet_tx)?;
+    handle
+        .insert_source(pets, |event, _, app: &mut App| {
+            if let channel::Event::Msg(selection) = event {
+                app.reload_pet(&selection);
+            }
+        })
+        .map_err(|e| anyhow!("insert pet channel: {e}"))?;
 
     // Active-window facts: the backend (Hyprland socket thread or wlr
     // foreign-toplevel on this connection) pushes raw facts here; the
@@ -324,6 +332,42 @@ fn spawn_bridge<T: Clone + Send + Sync + 'static>(
 }
 
 impl App {
+    fn reload_pet(&mut self, selection: &PetSelection) {
+        let loaded = (|| -> Result<_> {
+            let dir = resolve_pet_dir_for(selection.skin.as_deref())?;
+            let pet = PetDef::load(&dir)?;
+            let sheet = Sheet::load(&pet)?;
+            if pet.frame_width != self.pet.frame_width || pet.frame_height != self.pet.frame_height
+            {
+                anyhow::bail!(
+                    "hot-loaded pet frame size {}x{} differs from active {}x{}",
+                    pet.frame_width,
+                    pet.frame_height,
+                    self.pet.frame_width,
+                    self.pet.frame_height
+                );
+            }
+            Ok((dir, pet, sheet))
+        })();
+        match loaded {
+            Ok((dir, pet, sheet)) => {
+                // Decode both assets first, then replace their active pair together.
+                self.timeline = Timeline::new(&pet, self.now_ms());
+                self.gaze_capable = pet.rows >= crate::sprite::pet_json::V2_ROWS;
+                self.gaze = None;
+                self.pet = pet;
+                self.sheet = sheet;
+                let track = semantics::track_for(self.last_state, &self.pet);
+                self.timeline.request_state(track, self.now_ms());
+                self.update_gaze();
+                self.render_frame();
+                self.rearm_timer();
+                info!(pet = %self.pet.id, dir = %dir.display(), "pet hot-reloaded");
+            }
+            Err(error) => warn!(%error, "pet hot-reload rejected; keeping current assets"),
+        }
+    }
+
     fn now_ms(&self) -> u64 {
         self.started.elapsed().as_millis() as u64
     }
@@ -383,12 +427,13 @@ impl App {
                 if let Some(token) = self.settle_token.take() {
                     self.loop_handle.remove(token);
                 }
-                match self
-                    .loop_handle
-                    .insert_source(Timer::from_deadline(at), |_, _, app: &mut App| {
+                match self.loop_handle.insert_source(
+                    Timer::from_deadline(at),
+                    |_, _, app: &mut App| {
                         app.on_settle_timer();
                         TimeoutAction::Drop
-                    }) {
+                    },
+                ) {
                     Ok(token) => self.settle_token = Some(token),
                     Err(e) => warn!("arm settle timer: {e}"),
                 }
@@ -688,7 +733,11 @@ impl App {
         self.render_frame();
         self.update_gaze(); // released; gaze may resume
         self.position.save(&self.position_path);
-        info!(x = self.position.margin_x, y = self.position.margin_y, "position saved");
+        info!(
+            x = self.position.margin_x,
+            y = self.position.margin_y,
+            "position saved"
+        );
     }
 
     pub(crate) fn hide(&mut self) {
@@ -843,4 +892,3 @@ fn block_on<F: std::future::Future>(fut: F) -> F::Output {
         }
     }
 }
-

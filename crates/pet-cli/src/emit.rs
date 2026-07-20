@@ -26,7 +26,10 @@ fn try_run(rest: &[&str]) -> anyhow::Result<()> {
         // Headless `codex exec` runs (automation, pane-summarizer title jobs)
         // are non-interactive, unfocusable, and flood the pet with one-shot
         // sessions — drop them. Interactive codex (the TUI) is kept.
-        ["codex"] if codex_is_headless() => return Ok(()),
+        ["codex"] if codex_is_headless() => {
+            drain_stdin();
+            return Ok(());
+        }
         ["codex-notify", _] if codex_is_headless() => return Ok(()),
         ["codex"] => pet_adapters::codex::map_hook(&read_stdin()?, parent_pid())?,
         ["codex-notify", json] => pet_adapters::codex::map_notify(json)?,
@@ -159,6 +162,13 @@ fn read_stdin() -> anyhow::Result<String> {
     let mut buf = String::new();
     std::io::stdin().read_to_string(&mut buf)?;
     Ok(buf)
+}
+
+/// Consume stdin without buffering it. Even a dropped hook must drain the
+/// pipe: the harness blocks writing payloads past the pipe buffer and gets
+/// EPIPE ("failed to write hook stdin: Broken pipe") if we exit first.
+fn drain_stdin() {
+    let _ = std::io::copy(&mut std::io::stdin().lock(), &mut std::io::sink());
 }
 
 /// True when this codex hook/notify was fired by a headless `codex exec`

@@ -166,7 +166,11 @@ impl PetDef {
 /// TODO(v1): unify with pet-daemon's config.rs so `[pet] skin` drives this;
 /// the env vars are the v0 stub.
 pub fn resolve_pet_dir() -> Result<PathBuf> {
-    if let Ok(skin) = std::env::var("AGENT_PET_SKIN") {
+    resolve_pet_dir_for(std::env::var("AGENT_PET_SKIN").ok().as_deref())
+}
+
+pub fn resolve_pet_dir_for(skin: Option<&str>) -> Result<PathBuf> {
+    if let Some(skin) = skin.filter(|skin| !skin.is_empty()) {
         let dir = if skin.contains('/') {
             PathBuf::from(&skin)
         } else {
@@ -175,7 +179,7 @@ pub fn resolve_pet_dir() -> Result<PathBuf> {
         if dir.join("pet.json").is_file() || dir.is_file() {
             return Ok(dir);
         }
-        bail!("AGENT_PET_SKIN={skin} has no pet.json at {}", dir.display());
+        bail!("skin {skin:?} has no pet.json at {}", dir.display());
     }
     for data_dir in data_dirs() {
         let dir = data_dir.join("agent-pet/default-pet");
@@ -202,9 +206,14 @@ fn data_dirs() -> Vec<PathBuf> {
     let mut dirs = vec![std::env::var("XDG_DATA_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|_| home().join(".local/share"))];
-    let system = std::env::var("XDG_DATA_DIRS")
-        .unwrap_or_else(|_| "/usr/local/share:/usr/share".into());
-    dirs.extend(system.split(':').filter(|p| !p.is_empty()).map(PathBuf::from));
+    let system =
+        std::env::var("XDG_DATA_DIRS").unwrap_or_else(|_| "/usr/local/share:/usr/share".into());
+    dirs.extend(
+        system
+            .split(':')
+            .filter(|p| !p.is_empty())
+            .map(PathBuf::from),
+    );
     dirs
 }
 
@@ -250,7 +259,10 @@ struct AnimationSpec {
 #[serde(untagged)]
 enum FrameEntry {
     Index(usize),
-    Timed { sprite_index: usize, duration_ms: u64 },
+    Timed {
+        sprite_index: usize,
+        duration_ms: u64,
+    },
 }
 
 fn build_animations(
@@ -420,6 +432,16 @@ fn resolve_spritesheet_path(dir: &Path, name: &str) -> Result<PathBuf> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn explicit_skin_path_resolves_without_environment_translation() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("pet.json"), "{}").unwrap();
+        assert_eq!(
+            resolve_pet_dir_for(Some(dir.path().to_str().unwrap())).unwrap(),
+            dir.path()
+        );
+    }
+
     fn parse(raw: &str) -> Result<PetDef> {
         PetDef::parse(raw, Path::new("/tmp/pet"), "testpet")
     }
@@ -448,8 +470,7 @@ mod tests {
 
     #[test]
     fn rejects_frame_count_over_cap() {
-        let err =
-            parse(r#"{"frame": {"width":4,"height":4,"columns":32,"rows":9}}"#).unwrap_err();
+        let err = parse(r#"{"frame": {"width":4,"height":4,"columns":32,"rows":9}}"#).unwrap_err();
         assert!(err.to_string().contains("exceeds maximum 256"));
     }
 
@@ -519,11 +540,17 @@ mod tests {
         let pet = parse(&format!(r#"{{ {GRID_8X9_64} }}"#)).unwrap();
         let idle = &pet.animations["idle"];
         assert_eq!(
-            idle.frames.iter().map(|f| f.sprite_index).collect::<Vec<_>>(),
+            idle.frames
+                .iter()
+                .map(|f| f.sprite_index)
+                .collect::<Vec<_>>(),
             vec![0, 1, 2, 3, 4, 5]
         );
         assert_eq!(
-            idle.frames.iter().map(|f| f.duration_ms).collect::<Vec<_>>(),
+            idle.frames
+                .iter()
+                .map(|f| f.duration_ms)
+                .collect::<Vec<_>>(),
             IDLE_TIMINGS_MS.to_vec()
         );
         assert_eq!(idle.loop_start, Some(0));
@@ -556,8 +583,20 @@ mod tests {
         ))
         .unwrap();
         let idle = &pet.animations["idle"];
-        assert_eq!(idle.frames[0], Frame { sprite_index: 3, duration_ms: 100 });
-        assert_eq!(idle.frames[1], Frame { sprite_index: 4, duration_ms: 900 });
+        assert_eq!(
+            idle.frames[0],
+            Frame {
+                sprite_index: 3,
+                duration_ms: 100
+            }
+        );
+        assert_eq!(
+            idle.frames[1],
+            Frame {
+                sprite_index: 4,
+                duration_ms: 900
+            }
+        );
     }
 
     #[test]
@@ -611,7 +650,11 @@ mod tests {
         assert_eq!(waving.frames.len(), 4);
         assert_eq!(waving.frames[0].sprite_index, 24); // row 3 * 8
         assert_eq!(
-            waving.frames.iter().map(|f| f.duration_ms).collect::<Vec<_>>(),
+            waving
+                .frames
+                .iter()
+                .map(|f| f.duration_ms)
+                .collect::<Vec<_>>(),
             vec![140, 140, 140, 280]
         );
         let jumping = &pet.animations["jumping"];
@@ -635,7 +678,10 @@ mod tests {
 
     #[test]
     fn committed_default_asset_loads() {
-        let dir = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/default-pet"));
+        let dir = Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../assets/default-pet"
+        ));
         let pet = PetDef::load(dir).unwrap();
         assert_eq!(pet.id, "default");
         assert_eq!(pet.frame_count(), 72);

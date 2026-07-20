@@ -141,6 +141,18 @@ impl Config {
     }
 }
 
+pub fn path() -> PathBuf {
+    config_home().join("agent-pet/config.toml")
+}
+
+pub fn load_pet() -> anyhow::Result<PetConfig> {
+    match std::fs::read_to_string(path()) {
+        Ok(text) => Ok(toml::from_str::<FileConfig>(&text)?.pet),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(PetConfig::default()),
+        Err(error) => Err(error.into()),
+    }
+}
+
 fn parse_duration_ms(text: &str) -> Option<i64> {
     let text = text.trim();
     if let Ok(ms) = text.parse::<i64>() {
@@ -185,5 +197,11 @@ mod tests {
         assert_eq!(parse_duration_ms("7d"), Some(604_800_000));
         assert_eq!(parse_duration_ms("1500"), Some(1500));
         assert_eq!(parse_duration_ms("nope"), None);
+    }
+
+    #[test]
+    fn pet_skin_parses_independently() {
+        let file: FileConfig = toml::from_str("[pet]\nskin = 'fenny-frank'\n").unwrap();
+        assert_eq!(file.pet.skin.as_deref(), Some("fenny-frank"));
     }
 }

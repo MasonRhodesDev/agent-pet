@@ -47,8 +47,7 @@ fn acquire_singleton_lock() -> anyhow::Result<()> {
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
 
@@ -77,6 +76,10 @@ async fn main() -> anyhow::Result<()> {
     let (snapshot_tx, snapshot_rx) =
         tokio::sync::watch::channel(std::sync::Arc::new(pet_proto::Snapshot::default()));
     let (control_tx, control_rx) = tokio::sync::watch::channel(pet_render::Control::default());
+    let env_skin = std::env::var("AGENT_PET_SKIN").ok();
+    let initial_skin = env_skin.clone().or_else(|| config.pet.skin.clone());
+    let (pet_tx, pet_rx) =
+        tokio::sync::watch::channel(pet_render::PetSelection { skin: initial_skin });
     let (ui_tx, mut ui_rx) = tokio::sync::mpsc::unbounded_channel::<pet_proto::UiAction>();
     // Active-window facts need the Model (session metas) to join, so they go
     // to the runtime rather than being mapped inline like other UiActions.
@@ -127,21 +130,16 @@ async fn main() -> anyhow::Result<()> {
         ));
     }
 
-    // Config-driven skin selection: the renderer resolves AGENT_PET_SKIN
-    // (name under ~/.config/agent-pet/pets/, or a path). An externally-set
-    // env var still wins, for dev iteration.
-    if let Some(skin) = config.pet.skin.as_deref() {
-        if std::env::var_os("AGENT_PET_SKIN").is_none() && !skin.is_empty() {
-            // SAFETY: set before the renderer thread is spawned; nothing else
-            // reads the environment concurrently at this point.
-            unsafe { std::env::set_var("AGENT_PET_SKIN", skin) };
-        }
+    if env_skin.is_none() {
+        tokio::spawn(watch_pet_config(pet_tx));
+    } else {
+        info!("AGENT_PET_SKIN overrides config hot reload");
     }
 
     // The renderer supervises itself (backoff + panic capture); it can never
     // take the daemon down.
     if !headless {
-        let _renderer = pet_render::spawn(snapshot_rx.clone(), control_rx, ui_tx);
+        let _renderer = pet_render::spawn(snapshot_rx.clone(), control_rx, ui_tx, pet_rx);
     } else {
         drop(control_rx); // Show()/Hide() answer "renderer not running"
         drop(ui_tx);
@@ -195,4 +193,26 @@ async fn main() -> anyhow::Result<()> {
     info!("shutting down");
     runtime.abort();
     Ok(())
+}
+
+async fn watch_pet_config(tx: tokio::sync::watch::Sender<pet_render::PetSelection>) {
+    let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
+    let mut current = tx.borrow().skin.clone();
+    loop {
+        interval.tick().await;
+        match config::load_pet() {
+            Ok(pet) if pet.skin != current => {
+                current = pet.skin.clone();
+                if tx
+                    .send(pet_render::PetSelection { skin: pet.skin })
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            Ok(_) => {}
+            Err(error) => tracing::warn!(%error, path = %config::path().display(),
+                "ignoring malformed config during hot reload"),
+        }
+    }
 }

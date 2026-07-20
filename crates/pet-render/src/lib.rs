@@ -27,6 +27,11 @@ use pet_proto::{Snapshot, UiAction};
 use tokio::sync::{mpsc, watch};
 use tracing::{error, info, warn};
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PetSelection {
+    pub skin: Option<String>,
+}
+
 /// Daemon -> renderer commands. Watch-carried with a sequence number so a
 /// restarted renderer can tell a fresh command from a stale replay.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -45,10 +50,11 @@ pub fn spawn(
     snapshot_rx: watch::Receiver<Arc<Snapshot>>,
     control_rx: watch::Receiver<Control>,
     ui_tx: mpsc::UnboundedSender<UiAction>,
+    pet_rx: watch::Receiver<PetSelection>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name("pet-render".into())
-        .spawn(move || supervise(snapshot_rx, control_rx, ui_tx))
+        .spawn(move || supervise(snapshot_rx, control_rx, ui_tx, pet_rx))
         .expect("spawn pet-render thread")
 }
 
@@ -62,12 +68,18 @@ fn supervise(
     rx: watch::Receiver<Arc<Snapshot>>,
     control_rx: watch::Receiver<Control>,
     ui_tx: mpsc::UnboundedSender<UiAction>,
+    pet_rx: watch::Receiver<PetSelection>,
 ) {
     let mut failures: usize = 0;
     loop {
         let attempt_started = Instant::now();
         let result = catch_unwind(AssertUnwindSafe(|| {
-            app::run(rx.clone(), control_rx.clone(), ui_tx.clone())
+            app::run(
+                rx.clone(),
+                control_rx.clone(),
+                ui_tx.clone(),
+                pet_rx.clone(),
+            )
         }));
         match result {
             Ok(Ok(())) => {

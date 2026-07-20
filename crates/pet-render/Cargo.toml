@@ -17,3 +17,6 @@ tokio = { workspace = true, features = ["sync"] }
 smithay-client-toolkit.workspace = true
 image.workspace = true
 cosmic-text.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
