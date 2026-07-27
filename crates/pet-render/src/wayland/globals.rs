@@ -86,14 +86,14 @@ impl CompositorHandler for App {
         &mut self,
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
-        _surface: &wl_surface::WlSurface,
+        surface: &wl_surface::WlSurface,
         new_factor: i32,
     ) {
         // Integer buffer scale only in v0. TODO(render-v1): bind
         // wp_fractional_scale_v1 + wp_viewporter for fractional outputs
         // (SCTK 0.20 has no helper; ~80 lines of manual protocol).
         debug!(new_factor, "buffer scale changed");
-        self.set_output_scale(new_factor);
+        self.on_surface_scale(surface, new_factor);
     }
 
     fn transform_changed(
@@ -121,17 +121,10 @@ impl CompositorHandler for App {
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
         _surface: &wl_surface::WlSurface,
-        output: &wl_output::WlOutput,
+        _output: &wl_output::WlOutput,
     ) {
-        // Latch the first enter only: layer margins stay relative to the
-        // output the surface was mapped on, and later enters (the surface
-        // overlapping a neighbour mid-drag) must not move the margin frame.
-        // Unmap resets the latch. Interim until the per-output SurfaceSet.
-        if self.mascot.entered.is_none() {
-            self.mascot.entered = Some(output.clone());
-        }
-        self.ensure_position();
-        self.sync_layout();
+        // Each surface's output is known by construction (SurfaceSet binds
+        // one per output); enter/leave carry no extra information.
     }
 
     fn surface_leave(
@@ -155,8 +148,7 @@ impl OutputHandler for App {
         _qh: &QueueHandle<Self>,
         _output: wl_output::WlOutput,
     ) {
-        self.ensure_position();
-        self.sync_layout();
+        self.on_outputs_changed();
     }
 
     fn update_output(
@@ -165,8 +157,9 @@ impl OutputHandler for App {
         _qh: &QueueHandle<Self>,
         _output: wl_output::WlOutput,
     ) {
-        self.ensure_position();
-        self.sync_layout();
+        // Geometry may have shifted, and xdg-output logical info often lands
+        // here, after new_output — re-resolve everything.
+        self.on_outputs_changed();
     }
 
     fn output_destroyed(

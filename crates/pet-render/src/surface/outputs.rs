@@ -63,22 +63,43 @@ mod tests {
     use super::*;
 
     fn rect(name: &str, x: i32, y: i32, w: i32, h: i32) -> OutputRect {
-        OutputRect { name: name.into(), x, y, w, h }
+        OutputRect {
+            name: name.into(),
+            x,
+            y,
+            w,
+            h,
+        }
     }
 
     fn two_side_by_side() -> Vec<OutputRect> {
         // DP-1 at origin (3440×1440), DP-2 to its right (1920×1080).
-        vec![rect("DP-1", 0, 0, 3440, 1440), rect("DP-2", 3440, 0, 1920, 1080)]
+        vec![
+            rect("DP-1", 0, 0, 3440, 1440),
+            rect("DP-2", 3440, 0, 1920, 1080),
+        ]
     }
 
     #[test]
     fn output_at_picks_the_containing_monitor() {
         let outs = two_side_by_side();
-        assert_eq!(output_at(&outs, 100, 100).map(|o| o.name.as_str()), Some("DP-1"));
-        assert_eq!(output_at(&outs, 3500, 200).map(|o| o.name.as_str()), Some("DP-2"));
+        assert_eq!(
+            output_at(&outs, 100, 100).map(|o| o.name.as_str()),
+            Some("DP-1")
+        );
+        assert_eq!(
+            output_at(&outs, 3500, 200).map(|o| o.name.as_str()),
+            Some("DP-2")
+        );
         // The right edge of DP-1 (x=3440) belongs to DP-2, not DP-1 (half-open).
-        assert_eq!(output_at(&outs, 3440, 0).map(|o| o.name.as_str()), Some("DP-2"));
-        assert_eq!(output_at(&outs, 3439, 0).map(|o| o.name.as_str()), Some("DP-1"));
+        assert_eq!(
+            output_at(&outs, 3440, 0).map(|o| o.name.as_str()),
+            Some("DP-2")
+        );
+        assert_eq!(
+            output_at(&outs, 3439, 0).map(|o| o.name.as_str()),
+            Some("DP-1")
+        );
         // Below DP-2 (y>1080) but within DP-1's height gap: off every screen.
         assert_eq!(output_at(&outs, 4000, 1200), None);
     }
@@ -87,9 +108,15 @@ mod tests {
     fn nearest_output_is_the_off_screen_fallback() {
         let outs = two_side_by_side();
         // A point off the bottom-right: nearest DP-2 (its centre is closer).
-        assert_eq!(nearest_output(&outs, 5400, 1400).map(|o| o.name.as_str()), Some("DP-2"));
+        assert_eq!(
+            nearest_output(&outs, 5400, 1400).map(|o| o.name.as_str()),
+            Some("DP-2")
+        );
         // Far left of everything → DP-1.
-        assert_eq!(nearest_output(&outs, -500, 700).map(|o| o.name.as_str()), Some("DP-1"));
+        assert_eq!(
+            nearest_output(&outs, -500, 700).map(|o| o.name.as_str()),
+            Some("DP-1")
+        );
         assert_eq!(nearest_output(&[], 0, 0), None);
     }
 
@@ -98,7 +125,10 @@ mod tests {
         let r = rect("DP-2", 3440, 0, 1920, 1080);
         let (w, h) = (192, 208);
         // Past the right/bottom edges → pulled back so the sprite fits.
-        assert_eq!(clamp_into(&r, 9999, 9999, w, h), (3440 + 1920 - 192, 1080 - 208));
+        assert_eq!(
+            clamp_into(&r, 9999, 9999, w, h),
+            (3440 + 1920 - 192, 1080 - 208)
+        );
         // Before the origin → snapped to the origin.
         assert_eq!(clamp_into(&r, 3000, -50, w, h), (3440, 0));
         // Already inside → unchanged.

@@ -99,9 +99,10 @@ impl AlertBubble {
     pub fn apply(&mut self, snapshot: &Snapshot, now_ms: u64) -> bool {
         match alert_for(snapshot) {
             Some((key, label, body)) => {
-                let same_content = self.slot.as_ref().is_some_and(|b| {
-                    b.key == key && b.label == label && b.body == body
-                });
+                let same_content = self
+                    .slot
+                    .as_ref()
+                    .is_some_and(|b| b.key == key && b.label == label && b.body == body);
                 if !same_content {
                     // Genuinely new/changed alert: fresh reveal, and the old
                     // dismissal no longer applies.
@@ -243,7 +244,16 @@ pub fn draw(
 
     let tx = (bx + pad) as i32;
     let ty = (by + pad) as i32;
-    text.draw(canvas, bubble.label, label_style, wrap_w, tx, ty, LABEL_COLOR, None);
+    text.draw(
+        canvas,
+        bubble.label,
+        label_style,
+        wrap_w,
+        tx,
+        ty,
+        LABEL_COLOR,
+        None,
+    );
     let visible = bubble.visible_bytes(now_ms).min(body.len());
     text.draw(
         canvas,
@@ -373,7 +383,12 @@ mod tests {
 
     #[test]
     fn empty_body_is_instantly_done() {
-        let b = Bubble::new(SessionKey::new(Source::Claude, "s"), "Ready", String::new(), 0);
+        let b = Bubble::new(
+            SessionKey::new(Source::Claude, "s"),
+            "Ready",
+            String::new(),
+            0,
+        );
         assert_eq!(b.typing_deadline_ms(0), None);
         assert_eq!(b.visible_bytes(0), 0);
     }

@@ -9,7 +9,6 @@ use smithay_client_toolkit::reexports::client::protocol::wl_seat::WlSeat;
 use smithay_client_toolkit::reexports::client::{Connection, QueueHandle};
 use smithay_client_toolkit::seat::pointer::{PointerEvent, PointerEventKind, PointerHandler};
 use smithay_client_toolkit::seat::{Capability, SeatHandler, SeatState};
-use smithay_client_toolkit::shell::WaylandSurface;
 use smithay_client_toolkit::{delegate_pointer, delegate_seat};
 use tracing::{debug, info};
 
@@ -71,13 +70,13 @@ impl PointerHandler for App {
         events: &[PointerEvent],
     ) {
         for event in events {
-            if event.surface != *self.mascot.layer.wl_surface() {
+            if self.surfaces.by_surface(&event.surface).is_none() {
                 continue;
             }
             let hit = hit_test(
                 event.position,
-                self.mascot.sprite_rect(),
-                self.mascot.bubble_rect,
+                self.surfaces.sprite_rect(),
+                self.surfaces.bubble_rect,
             );
             match event.kind {
                 PointerEventKind::Enter { .. } => {

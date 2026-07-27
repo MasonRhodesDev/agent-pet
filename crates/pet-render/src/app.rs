@@ -16,7 +16,9 @@ use smithay_client_toolkit::reexports::calloop::timer::{TimeoutAction, Timer};
 use smithay_client_toolkit::reexports::calloop::{EventLoop, LoopHandle, RegistrationToken};
 use smithay_client_toolkit::reexports::calloop_wayland_source::WaylandSource;
 use smithay_client_toolkit::reexports::client::globals::registry_queue_init;
+use smithay_client_toolkit::reexports::client::protocol::wl_output::WlOutput;
 use smithay_client_toolkit::reexports::client::protocol::wl_pointer::WlPointer;
+use smithay_client_toolkit::reexports::client::protocol::wl_surface::WlSurface;
 use smithay_client_toolkit::reexports::client::{Connection, Proxy, QueueHandle};
 use smithay_client_toolkit::reexports::protocols::wp::cursor_shape::v1::client::wp_cursor_shape_device_v1::{
     Shape, WpCursorShapeDeviceV1,
@@ -25,6 +27,7 @@ use smithay_client_toolkit::registry::RegistryState;
 use smithay_client_toolkit::seat::pointer::cursor_shape::CursorShapeManager;
 use smithay_client_toolkit::seat::pointer::PointerData;
 use smithay_client_toolkit::seat::SeatState;
+use smithay_client_toolkit::shell::wlr_layer::LayerShell;
 use smithay_client_toolkit::shell::WaylandSurface;
 use smithay_client_toolkit::shm::slot::SlotPool;
 use smithay_client_toolkit::shm::Shm;
@@ -42,9 +45,9 @@ use crate::sprite::semantics;
 use crate::sprite::sheet::Sheet;
 use crate::sprite::timeline::Timeline;
 use crate::surface::bubble::AlertBubble;
-use crate::surface::mascot::{Mascot, EDGE_MARGIN};
 use crate::surface::outputs::{self, OutputRect};
 use crate::surface::position::{LegacyPosition, Loaded, Position};
+use crate::surface::surface_set::{SurfaceSet, EDGE_MARGIN};
 use crate::surface::visibility::Visibility;
 use crate::text::TextRenderer;
 use crate::wayland::{buffers, globals};
@@ -57,7 +60,13 @@ pub struct App {
     pub compositor_state: CompositorState,
     pub shm: Shm,
     pub pool: SlotPool,
-    pub mascot: Mascot,
+    /// Kept for the run's lifetime: hotplugged outputs need new surfaces.
+    pub layer_shell: LayerShell,
+    /// One mascot layer surface per output.
+    pub surfaces: SurfaceSet,
+    /// The output whose surface currently draws the pet (contains its global
+    /// centre). `None` until output geometry arrives or when no outputs remain.
+    pub active_output: Option<WlOutput>,
     pub pet: PetDef,
     pub sheet: Sheet,
     pub timeline: Timeline,
@@ -159,18 +168,21 @@ pub fn run(
     let qh = event_queue.handle();
     let bound = globals::bind(&globals_list, &qh)?;
 
+    // No surface yet: surfaces are created per output as the output handlers
+    // learn about them (the initial registry roundtrip announces the existing
+    // ones within the first dispatches).
     let sprite_scale = compose::sprite_scale_for(pet.frame_height);
-    let mascot = Mascot::create(
-        &bound.compositor,
-        &bound.layer_shell,
-        &qh,
+    let surfaces = SurfaceSet::new(
         pet.frame_width * sprite_scale,
         pet.frame_height * sprite_scale,
         sprite_scale,
         position.visible,
-    )?;
-    let pool = SlotPool::new((mascot.surf_w * mascot.surf_h * 4 * 2) as usize, &bound.shm)
-        .context("create shm pool")?;
+    );
+    let pool = SlotPool::new(
+        (surfaces.surf_w * surfaces.surf_h * 4 * 2) as usize,
+        &bound.shm,
+    )
+    .context("create shm pool")?;
 
     let mut event_loop = EventLoop::<'static, App>::try_new().context("create event loop")?;
     let handle = event_loop.handle();
@@ -184,7 +196,9 @@ pub fn run(
         compositor_state: bound.compositor,
         shm: bound.shm,
         pool,
-        mascot,
+        layer_shell: bound.layer_shell,
+        surfaces,
+        active_output: None,
         timeline: Timeline::new(&pet, 0),
         pet,
         sheet,
@@ -234,7 +248,7 @@ pub fn run(
             channel::Event::Msg(snapshot) => {
                 let changed = app.apply_snapshot(&snapshot);
                 app.update_gaze(); // state may have entered/left idle
-                if changed && app.mascot.visibility.shown() {
+                if changed && app.surfaces.visibility.shown() {
                     app.render_frame();
                     app.rearm_timer();
                 }
@@ -322,7 +336,7 @@ pub fn run(
 /// deadline (sprite frame or typewriter character). Parks itself while the
 /// mascot is hidden; `ensure_timer` restarts it.
 fn timer_tick(_: Instant, _: &mut (), app: &mut App) -> TimeoutAction {
-    if !app.mascot.visibility.shown() {
+    if !app.surfaces.visibility.shown() {
         app.timer_token = None;
         return TimeoutAction::Drop;
     }
@@ -515,9 +529,21 @@ impl App {
     }
 
     pub(crate) fn render_frame(&mut self) {
-        if !self.mascot.configured || !self.mascot.visibility.shown() {
+        if !self.surfaces.visibility.shown() {
             return;
         }
+        // The pet draws on the active output's surface only.
+        let Some(output) = self.active_output.clone() else {
+            return;
+        };
+        let Some(oscale_raw) = self
+            .surfaces
+            .by_output(&output)
+            .filter(|os| os.configured)
+            .map(|os| os.scale)
+        else {
+            return;
+        };
         let now = self.now_ms();
         self.timeline.advance(now);
 
@@ -529,19 +555,19 @@ impl App {
             self.text = Some(TextRenderer::new());
         }
 
-        let (surf_w, surf_h) = self.mascot.surface_size();
-        let (mascot_x, mascot_y) = (self.mascot.mascot_x, self.mascot.mascot_y);
+        let (surf_w, surf_h) = self.surfaces.surface_size();
+        let (mascot_x, mascot_y) = (self.surfaces.mascot_x, self.surfaces.mascot_y);
 
         let geo = Geometry {
             surf_w,
             surf_h,
             mascot_x,
             mascot_y,
-            mascot_w: self.mascot.mascot_w,
-            bubble_above: self.mascot.bubble_above,
-            anchor_right: self.mascot.anchor_right,
-            sprite_scale: self.mascot.sprite_scale,
-            oscale: self.mascot.output_scale.max(1) as u32,
+            mascot_w: self.surfaces.mascot_w,
+            bubble_above: self.surfaces.bubble_above,
+            anchor_right: self.surfaces.anchor_right,
+            sprite_scale: self.surfaces.sprite_scale,
+            oscale: oscale_raw.max(1) as u32,
         };
         let (buf_w, buf_h) = geo.buf_size();
         let oscale = geo.oscale as i32;
@@ -555,13 +581,14 @@ impl App {
         } else {
             self.alert.visible().zip(self.text.as_mut())
         };
-        let result = buffers::present(
-            &mut self.pool,
-            self.mascot.layer.wl_surface(),
-            buf_w,
-            buf_h,
-            |buf| compose::scene(buf, &geo, sheet, timeline, gaze, bubble, now),
-        );
+        let surface = self
+            .surfaces
+            .by_output(&output)
+            .map(|os| os.layer.wl_surface().clone())
+            .expect("active surface checked above");
+        let result = buffers::present(&mut self.pool, &surface, buf_w, buf_h, |buf| {
+            compose::scene(buf, &geo, sheet, timeline, gaze, bubble, now)
+        });
         let bubble_px = match result {
             Ok(px) => px,
             Err(e) => {
@@ -569,8 +596,7 @@ impl App {
                 return;
             }
         };
-        // The drag surface's input region is the whole output (set once on
-        // enter_drag); only the docked bubble box tracks per-frame.
+        // Only the docked bubble box tracks per-frame.
         if dragging {
             return;
         }
@@ -580,18 +606,26 @@ impl App {
             w: w / oscale as u32,
             h: h / oscale as u32,
         });
-        if rect != self.mascot.bubble_rect {
-            self.mascot.bubble_rect = rect;
-            if let Err(e) = self.mascot.update_input_region(&self.compositor_state) {
+        if rect != self.surfaces.bubble_rect {
+            self.surfaces.bubble_rect = rect;
+            if let Err(e) = self
+                .surfaces
+                .update_input_region(&output, &self.compositor_state)
+            {
                 warn!("input region update failed: {e:#}");
             }
-            self.mascot.layer.commit();
+            self.surfaces.commit(&output);
         }
     }
 
     fn next_wakeup(&self) -> Instant {
-        if !self.mascot.configured {
-            // Poll gently until the first configure lands.
+        let active_ready = self
+            .active_output
+            .as_ref()
+            .and_then(|o| self.surfaces.by_output(o))
+            .is_some_and(|os| os.configured);
+        if !active_ready {
+            // Poll gently until an active surface is up and configured.
             return Instant::now() + Duration::from_millis(200);
         }
         let now = self.now_ms();
@@ -605,7 +639,7 @@ impl App {
 
     /// Start the frame timer if it is not running (post-show / startup).
     pub(crate) fn ensure_timer(&mut self) {
-        if self.timer_token.is_some() || !self.mascot.visibility.shown() {
+        if self.timer_token.is_some() || !self.surfaces.visibility.shown() {
             return;
         }
         let handle = self.loop_handle.clone();
@@ -648,17 +682,30 @@ impl App {
         device.set_shape(serial, shape);
     }
 
-    pub(crate) fn set_output_scale(&mut self, factor: i32) {
-        if factor == self.mascot.output_scale || factor < 1 {
+    /// A wl_surface's preferred integer buffer scale changed. Routed to the
+    /// owning surface; only the active surface re-renders.
+    pub(crate) fn on_surface_scale(&mut self, surface: &WlSurface, factor: i32) {
+        if factor < 1 {
             return;
         }
-        self.mascot.output_scale = factor;
-        if let Err(e) = self.mascot.layer.set_buffer_scale(factor as u32) {
-            warn!("set_buffer_scale({factor}) unsupported: {e:?}");
-            self.mascot.output_scale = 1;
-            return;
+        let is_active = {
+            let Some(os) = self.surfaces.by_surface_mut(surface) else {
+                return;
+            };
+            if os.scale == factor {
+                return;
+            }
+            os.scale = factor;
+            if let Err(e) = os.layer.set_buffer_scale(factor as u32) {
+                warn!("set_buffer_scale({factor}) unsupported: {e:?}");
+                os.scale = 1;
+                return;
+            }
+            self.active_output.as_ref() == Some(&os.output)
+        };
+        if is_active {
+            self.render_frame();
         }
-        self.render_frame();
     }
 
     /// Initialize the global position once output geometry is known: migrate
@@ -681,10 +728,10 @@ impl App {
             self.position.save(&self.position_path);
             return;
         }
-        let Some(rect) = self.entered_rect() else {
+        let Some(rect) = self.active_rect() else {
             return;
         };
-        let (mw, mh) = (self.mascot.mascot_w as i32, self.mascot.mascot_h as i32);
+        let (mw, mh) = (self.surfaces.mascot_w as i32, self.surfaces.mascot_h as i32);
         let (x, y) = outputs::clamp_into(
             &rect,
             rect.x + rect.w - mw - EDGE_MARGIN,
@@ -704,14 +751,24 @@ impl App {
         if self.drag.dragging() {
             return;
         }
+        let Some(output) = self.active_output.clone() else {
+            return;
+        };
         let margins = self.local_margins();
-        self.mascot.relayout(margins);
-        if let Err(e) = self.mascot.update_input_region(&self.compositor_state) {
+        self.surfaces.relayout(margins);
+        if let Err(e) = self
+            .surfaces
+            .update_input_region(&output, &self.compositor_state)
+        {
             warn!("input region update failed: {e:#}");
         }
-        self.mascot.apply_margins(margins);
-        if self.mascot.configured {
-            self.mascot.layer.commit();
+        self.surfaces.apply_margins(&output, margins);
+        if self
+            .surfaces
+            .by_output(&output)
+            .is_some_and(|os| os.configured)
+        {
+            self.surfaces.commit(&output);
         }
     }
 
@@ -739,7 +796,10 @@ impl App {
         };
         self.position.x = x;
         self.position.y = y;
-        self.mascot.apply_margins(self.local_margins()); // no relayout: quadrant frozen
+        if let Some(output) = self.active_output.clone() {
+            // No relayout: quadrant frozen for the drag.
+            self.surfaces.apply_margins(&output, self.local_margins());
+        }
         let now = self.now_ms();
         if let Some(walk) = self.walk.as_mut() {
             if let Some(dir) = walk.update(x, now) {
@@ -754,13 +814,13 @@ impl App {
     /// Drag finished: clamp on-screen, re-pick the layout quadrant for the
     /// resting position, persist.
     pub(crate) fn drag_drop(&mut self) {
-        if let Some(rect) = self.entered_rect() {
+        if let Some(rect) = self.active_rect() {
             let (x, y) = outputs::clamp_into(
                 &rect,
                 self.position.x,
                 self.position.y,
-                self.mascot.mascot_w as i32,
-                self.mascot.mascot_h as i32,
+                self.surfaces.mascot_w as i32,
+                self.surfaces.mascot_h as i32,
             );
             self.position.x = x;
             self.position.y = y;
@@ -769,12 +829,7 @@ impl App {
         self.walk = None;
         let base = semantics::track_for(self.last_state, &self.pet);
         self.timeline.request_state(base, self.now_ms());
-        let margins = self.local_margins();
-        self.mascot.relayout(margins);
-        self.mascot.apply_margins(margins);
-        if let Err(e) = self.mascot.update_input_region(&self.compositor_state) {
-            warn!("input region update failed: {e:#}");
-        }
+        self.sync_layout();
         self.render_frame();
         self.update_gaze(); // released; gaze may resume
         self.position.save(&self.position_path);
@@ -782,12 +837,12 @@ impl App {
     }
 
     pub(crate) fn hide(&mut self) {
-        if self.mascot.visibility == Visibility::Hidden {
+        if self.surfaces.visibility == Visibility::Hidden {
             return;
         }
         info!("hiding mascot");
         self.drag.release();
-        self.mascot.unmap();
+        self.surfaces.unmap_all();
         self.position.visible = false;
         self.position.save(&self.position_path);
         // A later `show` is a fresh reveal — let it greet again.
@@ -796,22 +851,96 @@ impl App {
     }
 
     pub(crate) fn show(&mut self) {
-        if self.mascot.visibility.shown() {
+        if self.surfaces.visibility.shown() {
             return;
         }
         info!("showing mascot");
         self.position.visible = true;
         self.position.save(&self.position_path);
-        if self.mascot.configured {
-            // Never unmapped (startup-hidden): the first configure is still
-            // valid, attach straight away.
-            self.mascot.visibility = Visibility::Visible;
-            self.maybe_greet();
-            self.render_frame();
-            self.ensure_timer();
-        } else {
-            self.mascot.request_remap(self.local_margins());
+        self.surfaces.visibility = Visibility::Remapping;
+        self.resolve_active();
+        // Unmapped surfaces need a fresh initial commit + configure round;
+        // still-configured ones (startup-hidden) can attach straight away —
+        // sync_active reveals as soon as the active surface is ready.
+        let margins = self.local_margins();
+        let active = self.active_output.clone();
+        self.surfaces.request_remap_all(active.as_ref(), margins);
+        self.sync_active();
+    }
+
+    /// Reveal or refresh the pet on the active surface, once that surface is
+    /// configured. Runs the show transition (greet + timer) exactly on the
+    /// Remapping -> Visible edge; a no-op while hidden or unconfigured.
+    pub(crate) fn sync_active(&mut self) {
+        let ready = self
+            .active_output
+            .as_ref()
+            .and_then(|o| self.surfaces.by_output(o))
+            .is_some_and(|os| os.configured);
+        if !ready {
+            return;
         }
+        match self.surfaces.visibility {
+            Visibility::Hidden => {}
+            Visibility::Remapping => {
+                self.surfaces.visibility = Visibility::Visible;
+                self.maybe_greet();
+                self.render_frame();
+                self.ensure_timer();
+            }
+            Visibility::Visible => self.render_frame(),
+        }
+    }
+
+    /// An output appeared or its info changed: make sure it has a surface,
+    /// then re-resolve placement and the active surface.
+    pub(crate) fn on_outputs_changed(&mut self) {
+        self.ensure_surfaces();
+        self.ensure_position();
+        self.resolve_active();
+        self.sync_layout();
+        self.sync_active();
+    }
+
+    /// Create a mascot surface for every output that lacks one.
+    pub(crate) fn ensure_surfaces(&mut self) {
+        let outputs: Vec<WlOutput> = self.output_state.outputs().collect();
+        for output in outputs {
+            if let Err(e) = self.surfaces.add_for_output(
+                &self.compositor_state,
+                &self.layer_shell,
+                &self.qh,
+                &output,
+            ) {
+                self.error = Some(e.context("create mascot surface"));
+                return;
+            }
+        }
+    }
+
+    /// Recompute which output's surface should draw the pet: the one whose
+    /// rect contains the pet's centre, else the nearest. Falls back to the
+    /// first surface when no output reports logical geometry.
+    pub(crate) fn resolve_active(&mut self) {
+        let rects = globals::output_rects(&self.output_state);
+        let (cx, cy) = (
+            self.position.x + self.surfaces.mascot_w as i32 / 2,
+            self.position.y + self.surfaces.mascot_h as i32 / 2,
+        );
+        self.active_output = match outputs::resolve(&rects, cx, cy) {
+            Some((rect, _, _)) => self.output_for_rect(rect),
+            None => self.surfaces.first_output(),
+        };
+    }
+
+    fn output_for_rect(&self, rect: &OutputRect) -> Option<WlOutput> {
+        self.output_state.outputs().find(|o| {
+            self.output_state
+                .info(o)
+                .and_then(|i| globals::rect_for(&i))
+                .as_ref()
+                == Some(rect)
+        })
     }
 
     /// A cursor point (global logical coords) arrived from the backend. Turn
@@ -825,7 +954,7 @@ impl App {
         // don't mask it with a gaze frame. Let it finish; gaze resumes once
         // the timeline settles back to idle.
         if self.timeline.current_track() != "idle" {
-            if self.gaze.take().is_some() && self.mascot.visibility.shown() {
+            if self.gaze.take().is_some() && self.surfaces.visibility.shown() {
                 self.render_frame();
             }
             return;
@@ -833,7 +962,7 @@ impl App {
         let (cx, cy) = self.pet_center_global();
         // Deadzone ≈ one sprite width: the cursor resting on the pet reads as
         // "looking straight ahead" (idle), not a jittery near-centre stare.
-        let deadzone = self.mascot.mascot_w as f64;
+        let deadzone = self.surfaces.mascot_w as f64;
         let next = crate::sprite::gaze::gaze_frame(
             x as f64 - cx,
             y as f64 - cy,
@@ -842,7 +971,7 @@ impl App {
         );
         if next != self.gaze {
             self.gaze = next;
-            if self.mascot.visibility.shown() {
+            if self.surfaces.visibility.shown() {
                 self.render_frame();
             }
         }
@@ -851,17 +980,16 @@ impl App {
     /// The pet's on-screen centre in global logical coords, to match the
     /// cursor's coordinate space (the position itself is global now).
     fn pet_center_global(&self) -> (f64, f64) {
-        let cx = self.position.x + self.mascot.mascot_w as i32 / 2;
-        let cy = self.position.y + self.mascot.mascot_h as i32 / 2;
+        let cx = self.position.x + self.surfaces.mascot_w as i32 / 2;
+        let cy = self.position.y + self.surfaces.mascot_h as i32 / 2;
         (cx as f64, cy as f64)
     }
 
-    /// Logical rect of the output the surface sits on (the latched entered
-    /// output, else the first known output). When no output reports a global
-    /// logical position (no xdg-output), fall back to an origin-anchored rect
-    /// so single-monitor behavior is preserved.
-    fn entered_rect(&self) -> Option<OutputRect> {
-        let info = match &self.mascot.entered {
+    /// Logical rect of the active output (else the first known output). When
+    /// no output reports a global logical position (no xdg-output), fall back
+    /// to an origin-anchored rect so single-monitor behavior is preserved.
+    fn active_rect(&self) -> Option<OutputRect> {
+        let info = match &self.active_output {
             Some(output) => self.output_state.info(output),
             None => self
                 .output_state
@@ -885,7 +1013,7 @@ impl App {
     /// margins are made of. Falls back to the global point when no output
     /// geometry is known (origin-anchored, same as today's startup state).
     fn local_margins(&self) -> (i32, i32) {
-        match self.entered_rect() {
+        match self.active_rect() {
             Some(rect) => (self.position.x - rect.x, self.position.y - rect.y),
             None => (self.position.x, self.position.y),
         }
@@ -897,12 +1025,12 @@ impl App {
     /// hovering nor dragging (those own the sprite).
     pub(crate) fn update_gaze(&mut self) {
         let wanted = self.gaze_capable
-            && self.mascot.visibility.shown()
+            && self.surfaces.visibility.shown()
             && !self.hovering
             && !self.drag.dragging()
             && self.last_state == AgentState::Idle;
         self.gaze_wanted.store(wanted, Ordering::Relaxed);
-        if !wanted && self.gaze.take().is_some() && self.mascot.visibility.shown() {
+        if !wanted && self.gaze.take().is_some() && self.surfaces.visibility.shown() {
             self.render_frame(); // restore the timeline frame
         }
     }
