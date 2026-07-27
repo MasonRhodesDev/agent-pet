@@ -18,6 +18,7 @@ use smithay_client_toolkit::{
 use tracing::debug;
 
 use crate::app::App;
+use crate::surface::outputs::OutputRect;
 
 pub struct Bound {
     pub compositor: CompositorState,
@@ -54,6 +55,30 @@ pub fn logical_size(info: &OutputInfo) -> Option<(i32, i32)> {
             .find(|m| m.current)
             .map(|m| (m.dimensions.0 / scale, m.dimensions.1 / scale))
     })
+}
+
+/// An output's logical rect in the global coordinate space. `None` until
+/// xdg-output has delivered the logical position (size falls back to
+/// mode/scale) — such outputs can't participate in global placement yet.
+pub fn rect_for(info: &OutputInfo) -> Option<OutputRect> {
+    let (x, y) = info.logical_position?;
+    let (w, h) = logical_size(info)?;
+    Some(OutputRect {
+        name: info.name.clone().unwrap_or_default(),
+        x,
+        y,
+        w,
+        h,
+    })
+}
+
+/// All outputs with known logical geometry, as pure rects.
+pub fn output_rects(output_state: &OutputState) -> Vec<OutputRect> {
+    output_state
+        .outputs()
+        .filter_map(|o| output_state.info(&o))
+        .filter_map(|i| rect_for(&i))
+        .collect()
 }
 
 impl CompositorHandler for App {
@@ -98,7 +123,13 @@ impl CompositorHandler for App {
         _surface: &wl_surface::WlSurface,
         output: &wl_output::WlOutput,
     ) {
-        self.mascot.entered = Some(output.clone());
+        // Latch the first enter only: layer margins stay relative to the
+        // output the surface was mapped on, and later enters (the surface
+        // overlapping a neighbour mid-drag) must not move the margin frame.
+        // Unmap resets the latch. Interim until the per-output SurfaceSet.
+        if self.mascot.entered.is_none() {
+            self.mascot.entered = Some(output.clone());
+        }
         self.ensure_position();
         self.sync_layout();
     }

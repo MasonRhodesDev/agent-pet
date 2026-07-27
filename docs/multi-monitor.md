@@ -35,14 +35,20 @@ surfaces tile the whole desktop.
 - **1a** `surface/outputs.rs`: pure `OutputRect {name,x,y,w,h}` model + helpers
   `output_at(point)`, `nearest_output(point)`, `clamp_into(rect, size)`. Tested.
 - **1b** `Position` global model + migration; pure `global↔local` conversion. Tested.
-- **1c** Create the mascot surface on the **resolved output** (a real `WlOutput`
-  by name/rect), not `None`.
-- **1d** On drag **release** over a different output, recreate the surface there
-  (throw-to-monitor). *Delivers "any monitor" as a stepping stone.*
+- ~~**1c** Create the mascot surface on the resolved output.~~ **Skipped:**
+  needs the same "create surfaces once output info arrives" restructuring 2a
+  does anyway — done once, there.
+- ~~**1d** Recreate the surface on the drop output (throw-to-monitor).~~
+  **Skipped:** the destroy/recreate lifecycle is the riskiest code in the
+  drag path and 2a deletes it wholesale; throw-to-monitor falls out of 2a
+  for free (release resolves the active output, which just switches).
 
 ### Phase 2 — seamless cross-boundary drag
 - **2a** `SurfaceSet`: one `MascotSurface` per output (map), all mapped; pet
-  drawn on the active one, others blank + click-through.
+  drawn on the active one, others blank + click-through. Lands in two steps:
+  **2a-i** mechanical lifecycle refactor (surfaces created from the output
+  handlers, behavior-identical on one monitor), **2a-ii** blank click-through
+  inactive surfaces + drop-resolves-output (throw-to-monitor).
 - **2b** Drag hand-off: grab stays on the press surface; when the global centre
   crosses an output boundary, switch which surface draws the pet. (Straddle
   clipping deferred — snap when the centre crosses.)

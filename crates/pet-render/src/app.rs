@@ -43,7 +43,8 @@ use crate::sprite::sheet::Sheet;
 use crate::sprite::timeline::Timeline;
 use crate::surface::bubble::AlertBubble;
 use crate::surface::mascot::{Mascot, EDGE_MARGIN};
-use crate::surface::position::Position;
+use crate::surface::outputs::{self, OutputRect};
+use crate::surface::position::{LegacyPosition, Loaded, Position};
 use crate::surface::visibility::Visibility;
 use crate::text::TextRenderer;
 use crate::wayland::{buffers, globals};
@@ -63,8 +64,12 @@ pub struct App {
     pub alert: AlertBubble,
     /// Lazy: font enumeration only happens once a bubble is needed.
     pub text: Option<TextRenderer>,
+    /// Global logical top-left of the mascot (multi-output space).
     pub position: Position,
     pub position_initialized: bool,
+    /// A legacy output-local position file awaiting migration — resolved the
+    /// first time output geometry is known.
+    pub pending_legacy: Option<LegacyPosition>,
     pub position_path: PathBuf,
     pub drag: Drag,
     pub clicks: Clicks,
@@ -125,14 +130,29 @@ pub fn run(
     info!(pet = %pet.id, dir = %pet_dir.display(), backend = ?compositor::detect(), "pet loaded");
 
     let position_path = Position::state_path();
-    let saved = Position::load(&position_path);
-    let position_initialized = saved.is_some();
-    let position = saved.unwrap_or(Position {
-        output_name: None,
-        margin_x: 0,
-        margin_y: 0,
-        visible: true,
-    });
+    let (position, position_initialized, pending_legacy) = match Position::load(&position_path) {
+        Loaded::Global(pos) => (pos, true, None),
+        // Visibility applies immediately; the point migrates once output
+        // geometry arrives (ensure_position).
+        Loaded::Legacy(legacy) => (
+            Position {
+                x: 0,
+                y: 0,
+                visible: legacy.visible,
+            },
+            false,
+            Some(legacy),
+        ),
+        Loaded::None => (
+            Position {
+                x: 0,
+                y: 0,
+                visible: true,
+            },
+            false,
+            None,
+        ),
+    };
 
     let conn = Connection::connect_to_env().context("connect to wayland display")?;
     let (globals_list, event_queue) = registry_queue_init::<App>(&conn).context("init registry")?;
@@ -172,6 +192,7 @@ pub fn run(
         text: None,
         position,
         position_initialized,
+        pending_legacy,
         position_path,
         drag: Drag::Idle,
         clicks: Clicks::default(),
@@ -640,18 +661,39 @@ impl App {
         self.render_frame();
     }
 
-    /// Default bottom-right placement, once we know an output's geometry and
-    /// nothing was persisted.
+    /// Initialize the global position once output geometry is known: migrate
+    /// a legacy output-local file if one was loaded, else default to the
+    /// bottom-right of the surface's output.
     pub(crate) fn ensure_position(&mut self) {
         if self.position_initialized {
             return;
         }
-        let Some((out_w, out_h)) = self.output_logical() else {
+        if let Some(legacy) = &self.pending_legacy {
+            let Some(mut pos) = legacy.migrate(&globals::output_rects(&self.output_state)) else {
+                return; // no rects yet; retried on the next output event
+            };
+            // Visibility may have been toggled since startup; keep the live one.
+            pos.visible = self.position.visible;
+            info!(x = pos.x, y = pos.y, "migrated legacy position to global");
+            self.position = pos;
+            self.pending_legacy = None;
+            self.position_initialized = true;
+            self.position.save(&self.position_path);
+            return;
+        }
+        let Some(rect) = self.entered_rect() else {
             return;
         };
-        self.position.margin_x = out_w - self.mascot.mascot_w as i32 - EDGE_MARGIN;
-        self.position.margin_y = out_h - self.mascot.mascot_h as i32 - EDGE_MARGIN;
-        self.position.output_name = self.output_name();
+        let (mw, mh) = (self.mascot.mascot_w as i32, self.mascot.mascot_h as i32);
+        let (x, y) = outputs::clamp_into(
+            &rect,
+            rect.x + rect.w - mw - EDGE_MARGIN,
+            rect.y + rect.h - mh - EDGE_MARGIN,
+            mw,
+            mh,
+        );
+        self.position.x = x;
+        self.position.y = y;
         self.position_initialized = true;
     }
 
@@ -662,11 +704,12 @@ impl App {
         if self.drag.dragging() {
             return;
         }
-        self.mascot.relayout(&self.position);
+        let margins = self.local_margins();
+        self.mascot.relayout(margins);
         if let Err(e) = self.mascot.update_input_region(&self.compositor_state) {
             warn!("input region update failed: {e:#}");
         }
-        self.mascot.apply_margins(&self.position);
+        self.mascot.apply_margins(margins);
         if self.mascot.configured {
             self.mascot.layer.commit();
         }
@@ -680,10 +723,10 @@ impl App {
     /// stays fixed (only the margins move).
     pub(crate) fn begin_drag(&mut self) {
         self.hovering = false; // hover-jump is docked-only; clean slate
-        // Only walk if the pet has directional walk art (both rows); the
-        // default pet's rows 1-2 are blank, so it just slides.
+                               // Only walk if the pet has directional walk art (both rows); the
+                               // default pet's rows 1-2 are blank, so it just slides.
         self.walk = (self.track_has_art("running-right") && self.track_has_art("running-left"))
-            .then(|| Walk::new(self.position.margin_x));
+            .then(|| Walk::new(self.position.x));
         self.update_gaze(); // dragging owns the sprite; pause gaze
     }
 
@@ -691,16 +734,16 @@ impl App {
     /// surface bounds under the implicit grab). Moves the pet to keep the
     /// grab point under the cursor.
     pub(crate) fn on_drag_motion(&mut self, pointer: (f64, f64)) {
-        let Some((mx, my)) = self.drag.drag_to(pointer) else {
+        let Some((x, y)) = self.drag.drag_to(pointer) else {
             return;
         };
-        self.position.margin_x = mx;
-        self.position.margin_y = my;
-        self.mascot.apply_margins(&self.position); // no relayout: quadrant frozen
+        self.position.x = x;
+        self.position.y = y;
+        self.mascot.apply_margins(self.local_margins()); // no relayout: quadrant frozen
         let now = self.now_ms();
         if let Some(walk) = self.walk.as_mut() {
-            if let Some(dir) = walk.update(mx, now) {
-                debug!(?dir, vel = walk.vel(), mx, "walk flip");
+            if let Some(dir) = walk.update(x, now) {
+                debug!(?dir, vel = walk.vel(), x, "walk flip");
                 self.timeline.request_loop(dir.track(), now);
             }
         }
@@ -711,33 +754,31 @@ impl App {
     /// Drag finished: clamp on-screen, re-pick the layout quadrant for the
     /// resting position, persist.
     pub(crate) fn drag_drop(&mut self) {
-        let (ow, oh) = self
-            .output_logical()
-            .unwrap_or((self.mascot.surf_w as i32, self.mascot.surf_h as i32));
-        self.position.clamp(
-            ow,
-            oh,
-            self.mascot.mascot_w as i32,
-            self.mascot.mascot_h as i32,
-        );
-        self.position.output_name = self.output_name();
+        if let Some(rect) = self.entered_rect() {
+            let (x, y) = outputs::clamp_into(
+                &rect,
+                self.position.x,
+                self.position.y,
+                self.mascot.mascot_w as i32,
+                self.mascot.mascot_h as i32,
+            );
+            self.position.x = x;
+            self.position.y = y;
+        }
         // Stop walking, return to the base state (kept fresh from snapshots).
         self.walk = None;
         let base = semantics::track_for(self.last_state, &self.pet);
         self.timeline.request_state(base, self.now_ms());
-        self.mascot.relayout(&self.position);
-        self.mascot.apply_margins(&self.position);
+        let margins = self.local_margins();
+        self.mascot.relayout(margins);
+        self.mascot.apply_margins(margins);
         if let Err(e) = self.mascot.update_input_region(&self.compositor_state) {
             warn!("input region update failed: {e:#}");
         }
         self.render_frame();
         self.update_gaze(); // released; gaze may resume
         self.position.save(&self.position_path);
-        info!(
-            x = self.position.margin_x,
-            y = self.position.margin_y,
-            "position saved"
-        );
+        info!(x = self.position.x, y = self.position.y, "position saved");
     }
 
     pub(crate) fn hide(&mut self) {
@@ -769,7 +810,7 @@ impl App {
             self.render_frame();
             self.ensure_timer();
         } else {
-            self.mascot.request_remap(&self.position);
+            self.mascot.request_remap(self.local_margins());
         }
     }
 
@@ -808,16 +849,18 @@ impl App {
     }
 
     /// The pet's on-screen centre in global logical coords, to match the
-    /// cursor's coordinate space. Portable: the output's logical position
-    /// comes from xdg-output (SCTK `OutputInfo`), not a Hyprland query.
+    /// cursor's coordinate space (the position itself is global now).
     fn pet_center_global(&self) -> (f64, f64) {
-        let (ox, oy) = self.output_logical_position();
-        let cx = ox + self.position.margin_x + self.mascot.mascot_w as i32 / 2;
-        let cy = oy + self.position.margin_y + self.mascot.mascot_h as i32 / 2;
+        let cx = self.position.x + self.mascot.mascot_w as i32 / 2;
+        let cy = self.position.y + self.mascot.mascot_h as i32 / 2;
         (cx as f64, cy as f64)
     }
 
-    fn output_logical_position(&self) -> (i32, i32) {
+    /// Logical rect of the output the surface sits on (the latched entered
+    /// output, else the first known output). When no output reports a global
+    /// logical position (no xdg-output), fall back to an origin-anchored rect
+    /// so single-monitor behavior is preserved.
+    fn entered_rect(&self) -> Option<OutputRect> {
         let info = match &self.mascot.entered {
             Some(output) => self.output_state.info(output),
             None => self
@@ -825,8 +868,27 @@ impl App {
                 .outputs()
                 .next()
                 .and_then(|o| self.output_state.info(&o)),
-        };
-        info.and_then(|i| i.logical_position).unwrap_or((0, 0))
+        }?;
+        globals::rect_for(&info).or_else(|| {
+            let (w, h) = globals::logical_size(&info)?;
+            Some(OutputRect {
+                name: info.name.clone().unwrap_or_default(),
+                x: 0,
+                y: 0,
+                w,
+                h,
+            })
+        })
+    }
+
+    /// The mascot's top-left local to the surface's output — what layer
+    /// margins are made of. Falls back to the global point when no output
+    /// geometry is known (origin-anchored, same as today's startup state).
+    fn local_margins(&self) -> (i32, i32) {
+        match self.entered_rect() {
+            Some(rect) => (self.position.x - rect.x, self.position.y - rect.y),
+            None => (self.position.x, self.position.y),
+        }
     }
 
     /// Recompute whether the cursor source should be polling, flip the shared
@@ -843,30 +905,6 @@ impl App {
         if !wanted && self.gaze.take().is_some() && self.mascot.visibility.shown() {
             self.render_frame(); // restore the timeline frame
         }
-    }
-
-    fn output_logical(&self) -> Option<(i32, i32)> {
-        let info = match &self.mascot.entered {
-            Some(output) => self.output_state.info(output),
-            None => self
-                .output_state
-                .outputs()
-                .next()
-                .and_then(|o| self.output_state.info(&o)),
-        };
-        info.as_ref().and_then(globals::logical_size)
-    }
-
-    fn output_name(&self) -> Option<String> {
-        let info = match &self.mascot.entered {
-            Some(output) => self.output_state.info(output),
-            None => self
-                .output_state
-                .outputs()
-                .next()
-                .and_then(|o| self.output_state.info(&o)),
-        };
-        info.and_then(|i| i.name)
     }
 }
 

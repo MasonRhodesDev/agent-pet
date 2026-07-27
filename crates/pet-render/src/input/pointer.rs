@@ -114,15 +114,17 @@ impl PointerHandler for App {
                         self.set_cursor(cursor_for(false, hit));
                     }
                 }
-                PointerEventKind::Press { button: BTN_LEFT, .. } => {
+                PointerEventKind::Press {
+                    button: BTN_LEFT, ..
+                } => {
                     if self.clicks.press(hit) {
-                        self.drag.press(
-                            event.position,
-                            (self.position.margin_x, self.position.margin_y),
-                        );
+                        self.drag
+                            .press(event.position, (self.position.x, self.position.y));
                     }
                 }
-                PointerEventKind::Release { button: BTN_LEFT, .. } => {
+                PointerEventKind::Release {
+                    button: BTN_LEFT, ..
+                } => {
                     if self.clicks.release(hit) {
                         if let Some(bubble) = self.alert.visible() {
                             info!(key = %bubble.key, "bubble clicked: focus session");
@@ -147,7 +149,9 @@ impl PointerHandler for App {
                     }
                     self.set_cursor(cursor_for(false, hit));
                 }
-                PointerEventKind::Press { button: BTN_RIGHT, .. } => {
+                PointerEventKind::Press {
+                    button: BTN_RIGHT, ..
+                } => {
                     debug!("right-click: hiding mascot");
                     let _ = self.ui_tx.send(UiAction::SetVisible { visible: false });
                     self.drag.release();

@@ -20,7 +20,6 @@ use tracing::{info, warn};
 use crate::app::App;
 use crate::input::router::{self, Rect};
 use crate::surface::bubble;
-use crate::surface::position::Position;
 use crate::surface::visibility::Visibility;
 
 /// Gap from the screen edges for the default bottom-right placement.
@@ -115,9 +114,10 @@ impl Mascot {
 
     /// Pick the layout quadrant so the surface margins stay non-negative
     /// (the bubble flips below/right of the sprite near the top/left edges).
-    pub fn relayout(&mut self, pos: &Position) {
-        self.bubble_above = pos.margin_y >= (self.surf_h - self.mascot_h) as i32;
-        self.anchor_right = pos.margin_x >= (self.surf_w - self.mascot_w) as i32;
+    /// `(mx, my)` is the mascot's top-left local to the surface's output.
+    pub fn relayout(&mut self, (mx, my): (i32, i32)) {
+        self.bubble_above = my >= (self.surf_h - self.mascot_h) as i32;
+        self.anchor_right = mx >= (self.surf_w - self.mascot_w) as i32;
         self.mascot_x = if self.anchor_right {
             self.surf_w - self.mascot_w
         } else {
@@ -130,11 +130,11 @@ impl Mascot {
         };
     }
 
-    /// Derive surface margins from the mascot position (takes effect on the
-    /// next commit).
-    pub fn apply_margins(&self, pos: &Position) {
-        let left = pos.margin_x - self.mascot_x as i32;
-        let top = pos.margin_y - self.mascot_y as i32;
+    /// Derive surface margins from the mascot's output-local top-left (takes
+    /// effect on the next commit).
+    pub fn apply_margins(&self, (mx, my): (i32, i32)) {
+        let left = mx - self.mascot_x as i32;
+        let top = my - self.mascot_y as i32;
         self.layer.set_margin(top, 0, 0, left);
     }
 
@@ -162,7 +162,7 @@ impl Mascot {
 
     /// Re-request the mapped state after an unmap (the protocol requires a
     /// fresh initial commit + configure before a buffer may attach again).
-    pub fn request_remap(&mut self, pos: &Position) {
+    pub fn request_remap(&mut self, margins: (i32, i32)) {
         self.configured = false;
         self.visibility = Visibility::Remapping;
         self.layer.set_size(self.surf_w, self.surf_h);
@@ -170,7 +170,7 @@ impl Mascot {
         self.layer.set_exclusive_zone(-1);
         self.layer
             .set_keyboard_interactivity(KeyboardInteractivity::None);
-        self.apply_margins(pos);
+        self.apply_margins(margins);
         self.layer.commit();
     }
 
@@ -180,6 +180,8 @@ impl Mascot {
         self.layer.commit();
         self.configured = false;
         self.visibility = Visibility::Hidden;
+        // The next map may land on a different output; re-latch it.
+        self.entered = None;
     }
 }
 

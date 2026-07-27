@@ -1,4 +1,4 @@
-//! Pure drag FSM: click-vs-drag threshold + incremental margin moves.
+//! Pure drag FSM: click-vs-drag threshold + incremental position moves.
 //!
 //! The mascot stays a small docked surface throughout the drag — it is NOT
 //! expanded. Wayland's implicit pointer grab keeps motion events flowing to
@@ -14,8 +14,12 @@
 //! keep that grab point under the cursor:
 //!
 //! ```text
-//! margin += pointer_local - grab
+//! pos += pointer_local - grab
 //! ```
+//!
+//! The accumulated point is frame-agnostic — the invariant only needs the
+//! surface to slide by the applied delta. The app seeds it with the mascot's
+//! global top-left, so drags accumulate directly in global coords.
 //!
 //! This self-corrects: after a move the surface slides by that delta, so a
 //! stationary cursor's next surface-local reading is `grab` again (delta 0),
@@ -31,15 +35,15 @@ pub enum Drag {
     Pressed {
         /// Surface-local point where the pet was grabbed.
         grab: (f64, f64),
-        /// Pet's margins (top-left on the output) at press.
-        margin: (i32, i32),
+        /// Pet's global top-left at press.
+        pos: (i32, i32),
     },
-    /// Past the threshold: following the cursor by moving the margins.
+    /// Past the threshold: following the cursor by moving the position.
     Dragging {
         /// Surface-local grab point — fixed for the whole drag.
         grab: (f64, f64),
-        /// Current margins (updated each motion).
-        margin: (i32, i32),
+        /// Current global top-left (updated each motion).
+        pos: (i32, i32),
     },
 }
 
@@ -52,23 +56,20 @@ pub enum Release {
 }
 
 impl Drag {
-    /// Button press. `pointer` is surface-local; `margin` is the pet's
-    /// current top-left on the output.
-    pub fn press(&mut self, pointer: (f64, f64), margin: (i32, i32)) {
-        *self = Drag::Pressed {
-            grab: pointer,
-            margin,
-        };
+    /// Button press. `pointer` is surface-local; `pos` is the pet's current
+    /// global top-left.
+    pub fn press(&mut self, pointer: (f64, f64), pos: (i32, i32)) {
+        *self = Drag::Pressed { grab: pointer, pos };
     }
 
     /// Pre-drag motion (surface-local). Returns true exactly once, when the
     /// click-vs-drag threshold is first crossed → transitions to `Dragging`,
     /// keeping the same grab point and coordinate space.
     pub fn threshold_crossed(&mut self, pointer: (f64, f64)) -> bool {
-        if let Drag::Pressed { grab, margin } = *self {
+        if let Drag::Pressed { grab, pos } = *self {
             let (dx, dy) = (pointer.0 - grab.0, pointer.1 - grab.1);
             if dx * dx + dy * dy > THRESHOLD_SQ {
-                *self = Drag::Dragging { grab, margin };
+                *self = Drag::Dragging { grab, pos };
                 return true;
             }
         }
@@ -76,22 +77,22 @@ impl Drag {
     }
 
     /// Drag motion (surface-local). Applies the incremental move to keep the
-    /// grab point under the cursor and returns the new margins, or `None`
-    /// when not dragging.
+    /// grab point under the cursor and returns the new global top-left, or
+    /// `None` when not dragging.
     pub fn drag_to(&mut self, pointer: (f64, f64)) -> Option<(i32, i32)> {
-        if let Drag::Dragging { grab, margin } = self {
-            margin.0 += (pointer.0 - grab.0).round() as i32;
-            margin.1 += (pointer.1 - grab.1).round() as i32;
-            Some(*margin)
+        if let Drag::Dragging { grab, pos } = self {
+            pos.0 += (pointer.0 - grab.0).round() as i32;
+            pos.1 += (pointer.1 - grab.1).round() as i32;
+            Some(*pos)
         } else {
             None
         }
     }
 
-    /// Current margins while dragging.
-    pub fn margin(&self) -> Option<(i32, i32)> {
+    /// Current global top-left while dragging.
+    pub fn pos(&self) -> Option<(i32, i32)> {
         match self {
-            Drag::Dragging { margin, .. } => Some(*margin),
+            Drag::Dragging { pos, .. } => Some(*pos),
             _ => None,
         }
     }
@@ -230,7 +231,7 @@ mod tests {
         drag.press((10.0, 10.0), (100, 200));
         assert!(!drag.threshold_crossed((12.0, 12.0))); // sqrt(8) < 4
         assert!(!drag.threshold_crossed((13.0, 12.5)));
-        assert_eq!(drag.margin(), None);
+        assert_eq!(drag.pos(), None);
         assert_eq!(drag.release(), Release::Click);
         assert_eq!(drag, Drag::Idle);
     }
@@ -255,7 +256,7 @@ mod tests {
 
     #[test]
     fn drag_keeps_the_grab_point_under_the_cursor() {
-        // Grabbed at surface-local (40,50); pet at margins (300,200).
+        // Grabbed at surface-local (40,50); pet top-left at (300,200).
         let mut drag = Drag::Idle;
         drag.press((40.0, 50.0), (300, 200));
         assert!(drag.threshold_crossed((40.0, 60.0))); // 10px down → drag
@@ -284,11 +285,11 @@ mod tests {
     }
 
     #[test]
-    fn margin_is_none_unless_dragging() {
+    fn pos_is_none_unless_dragging() {
         let mut drag = Drag::Idle;
-        assert_eq!(drag.margin(), None);
+        assert_eq!(drag.pos(), None);
         drag.press((0.0, 0.0), (0, 0));
-        assert_eq!(drag.margin(), None); // pressed, not dragging
+        assert_eq!(drag.pos(), None); // pressed, not dragging
         assert_eq!(drag.drag_to((5.0, 5.0)), None);
     }
 
@@ -306,7 +307,14 @@ mod tests {
 
     /// Drive `walk` with steady travel of `step` px every `dt_ms` for
     /// `duration_ms`, returning the last direction it flipped to (if any).
-    fn drive(walk: &mut Walk, x: &mut i32, step: i32, dt_ms: u64, duration_ms: u64, t: &mut u64) -> Option<WalkDir> {
+    fn drive(
+        walk: &mut Walk,
+        x: &mut i32,
+        step: i32,
+        dt_ms: u64,
+        duration_ms: u64,
+        t: &mut u64,
+    ) -> Option<WalkDir> {
         let mut fired = None;
         let end = *t + duration_ms;
         while *t < end {
@@ -324,7 +332,10 @@ mod tests {
         let mut walk = Walk::new(0);
         let (mut x, mut t) = (0, 0);
         // Steady rightward travel (~2000 px/s) for 300ms commits Right.
-        assert_eq!(drive(&mut walk, &mut x, 2, 1, 300, &mut t), Some(WalkDir::Right));
+        assert_eq!(
+            drive(&mut walk, &mut x, 2, 1, 300, &mut t),
+            Some(WalkDir::Right)
+        );
         assert_eq!(walk.dir(), Some(WalkDir::Right));
     }
 
@@ -349,7 +360,10 @@ mod tests {
         drive(&mut walk, &mut x, -3, 1, 300, &mut t);
         assert_eq!(walk.dir(), Some(WalkDir::Left));
         // A real, sustained (>CONFIRM_MS) rightward reversal flips to Right.
-        assert_eq!(drive(&mut walk, &mut x, 3, 1, 300, &mut t), Some(WalkDir::Right));
+        assert_eq!(
+            drive(&mut walk, &mut x, 3, 1, 300, &mut t),
+            Some(WalkDir::Right)
+        );
     }
 
     #[test]
