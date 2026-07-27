@@ -956,12 +956,19 @@ impl App {
     /// the drag), move to the nearest remaining output. No renderer rebuild;
     /// with zero outputs left the pet simply waits for the next `new_output`.
     pub(crate) fn on_output_destroyed(&mut self, output: &WlOutput) {
-        let was_active = self.active_output.as_ref() == Some(output);
-        let was_press = self.press_output.as_ref() == Some(output);
         if !self.surfaces.remove_output(output) {
             return;
         }
-        info!(active = was_active, "output destroyed; surface torn down");
+        info!("output destroyed; surface torn down");
+        self.after_surface_loss(output);
+    }
+
+    /// Common recovery once `output`'s surface has left the set (output
+    /// unplugged, or the compositor closed the layer surface): drop stale
+    /// references, settle a drag that lost its grab, re-resolve and redraw.
+    pub(crate) fn after_surface_loss(&mut self, output: &WlOutput) {
+        let was_active = self.active_output.as_ref() == Some(output);
+        let was_press = self.press_output.as_ref() == Some(output);
         if was_active {
             self.active_output = None;
         }

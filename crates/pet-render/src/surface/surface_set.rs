@@ -290,11 +290,40 @@ fn set_input_region(
 }
 
 impl LayerShellHandler for App {
-    fn closed(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _layer: &LayerSurface) {
-        // Output gone or compositor shut the surface: bail out of the event
-        // loop and let the supervisor rebuild everything.
-        warn!("layer surface closed by compositor");
-        self.error = Some(anyhow::anyhow!("layer surface closed"));
+    fn closed(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, layer: &LayerSurface) {
+        // A single surface died — output loss or a compositor-side close.
+        // Handled locally: no supervisor rebuild. The supervisor remains for
+        // connection death, present failures, and panics only.
+        let Some(output) = self
+            .surfaces
+            .by_surface(layer.wl_surface())
+            .map(|os| os.output.clone())
+        else {
+            // Already torn down — `closed` and `output_destroyed` race in
+            // either order.
+            return;
+        };
+        self.surfaces.remove_output(&output);
+        // If the output is still around (e.g. the compositor closes layer
+        // surfaces on a mode change), try one immediate re-create; a failure
+        // there is a genuinely broken state and keeps the supervisor escape
+        // hatch.
+        let output_alive = self.output_state.outputs().any(|o| o == output);
+        if output_alive {
+            warn!("layer surface closed with its output alive; recreating");
+            if let Err(e) = self.surfaces.add_for_output(
+                &self.compositor_state,
+                &self.layer_shell,
+                &self.qh,
+                &output,
+            ) {
+                self.error = Some(e.context("recreate closed layer surface"));
+                return;
+            }
+        } else {
+            warn!("layer surface closed (output gone)");
+        }
+        self.after_surface_loss(&output);
     }
 
     fn configure(
