@@ -81,6 +81,27 @@ mod tests {
     }
 
     #[test]
+    fn seam_drag_hands_off_exactly_when_the_centre_crosses() {
+        // The drag hand-off resolves by the mascot's centre: a 128px sprite
+        // whose top-left passes gx=3376 puts its centre on the DP-2 side of
+        // the x=3440 seam (half-open: the seam column belongs to DP-2).
+        let outs = two_side_by_side();
+        let (w, h) = (128, 128);
+        for (gx, expect) in [
+            (3300, "DP-1"),
+            (3375, "DP-1"),
+            (3376, "DP-2"),
+            (3500, "DP-2"),
+        ] {
+            let (out, lx, ly) = resolve(&outs, gx + w / 2, 700 + h / 2).unwrap();
+            assert_eq!(out.name, expect, "gx={gx}");
+            // Local coords are the same linear map on either side of the
+            // seam — the press surface's margin mirror never jumps.
+            assert_eq!((lx, ly), (gx + w / 2 - out.x, 700 + h / 2 - out.y));
+        }
+    }
+
+    #[test]
     fn output_at_picks_the_containing_monitor() {
         let outs = two_side_by_side();
         assert_eq!(

@@ -81,6 +81,11 @@ pub struct App {
     pub pending_legacy: Option<LegacyPosition>,
     pub position_path: PathBuf,
     pub drag: Drag,
+    /// The output whose surface holds the implicit pointer grab for the
+    /// current press/drag. That surface must keep sliding 1:1 with the pet
+    /// (drag.rs's incremental invariant), even when the pet has crossed a
+    /// seam and draws elsewhere.
+    pub press_output: Option<WlOutput>,
     pub clicks: Clicks,
     /// Horizontal-travel tracker: drives the walk animation while dragging.
     pub walk: Option<Walk>,
@@ -209,6 +214,7 @@ pub fn run(
         pending_legacy,
         position_path,
         drag: Drag::Idle,
+        press_output: None,
         clicks: Clicks::default(),
         walk: None,
         hovering: false,
@@ -787,18 +793,48 @@ impl App {
         self.update_gaze(); // dragging owns the sprite; pause gaze
     }
 
-    /// A drag motion in the docked surface's local coords (which run off the
+    /// A drag motion in the press surface's local coords (which run off the
     /// surface bounds under the implicit grab). Moves the pet to keep the
-    /// grab point under the cursor.
+    /// grab point under the cursor, handing the drawing surface off when the
+    /// pet's centre crosses an output seam.
     pub(crate) fn on_drag_motion(&mut self, pointer: (f64, f64)) {
         let Some((x, y)) = self.drag.drag_to(pointer) else {
             return;
         };
         self.position.x = x;
         self.position.y = y;
-        if let Some(output) = self.active_output.clone() {
+        // Seam hand-off: when the centre crosses into another output, switch
+        // the drawing surface (resolve blanks the old one) and give the new
+        // one the pet's input region so the post-release hover state is
+        // already right.
+        let before = self.active_output.clone();
+        self.resolve_active();
+        let crossed = before != self.active_output;
+        if let Some(active) = self.active_output.clone() {
             // No relayout: quadrant frozen for the drag.
-            self.surfaces.apply_margins(&output, self.local_margins());
+            self.surfaces.apply_margins(&active, self.local_margins());
+            if crossed {
+                if let Err(e) = self
+                    .surfaces
+                    .update_input_region(&active, &self.compositor_state)
+                {
+                    warn!("input region update failed: {e:#}");
+                }
+            }
+        }
+        // The press surface must keep sliding 1:1 with the pet regardless of
+        // who draws it — drag.rs's incremental math reads pointer coords
+        // relative to it (a commit with no buffer applies margins alone).
+        if let Some(press) = self
+            .press_output
+            .clone()
+            .filter(|p| Some(p) != self.active_output.as_ref())
+        {
+            if let Some(rect) = self.rect_of(&press) {
+                self.surfaces
+                    .apply_margins(&press, (x - rect.x, y - rect.y));
+                self.surfaces.commit(&press);
+            }
         }
         let now = self.now_ms();
         if let Some(walk) = self.walk.as_mut() {
@@ -835,6 +871,15 @@ impl App {
         self.timeline.request_state(base, self.now_ms());
         self.sync_layout();
         self.render_frame();
+        // The press surface slid along under the grab; if it isn't the one
+        // drawing the pet, park it blank again.
+        if let Some(press) = self
+            .press_output
+            .take()
+            .filter(|p| Some(p) != self.active_output.as_ref())
+        {
+            self.blank_surface(&press);
+        }
         self.update_gaze(); // released; gaze may resume
         self.position.save(&self.position_path);
         info!(x = self.position.x, y = self.position.y, "position saved");
@@ -976,6 +1021,14 @@ impl App {
         if let Err(e) = result {
             self.error = Some(e.context("present blank frame"));
         }
+    }
+
+    /// Logical rect of a specific output, if it has reported one.
+    fn rect_of(&self, output: &WlOutput) -> Option<OutputRect> {
+        self.output_state
+            .info(output)
+            .as_ref()
+            .and_then(globals::rect_for)
     }
 
     fn output_for_rect(&self, rect: &OutputRect) -> Option<WlOutput> {

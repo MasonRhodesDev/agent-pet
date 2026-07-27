@@ -90,17 +90,28 @@ impl PointerHandler for App {
                     // only, no protocol call.
                     if !self.drag.dragging() {
                         self.drag.release();
+                        self.press_output = None;
                     }
                     self.clicks.cancel();
                     self.set_hover(false);
                     self.cursor = Cursor::Default;
                 }
                 PointerEventKind::Motion { .. } => {
+                    // While dragging, only the press surface's coordinate
+                    // space is meaningful (the implicit grab delivers there;
+                    // this guards the one-frame hand-off overlap window).
+                    let from_press = self
+                        .surfaces
+                        .by_surface(&event.surface)
+                        .is_some_and(|os| Some(&os.output) == self.press_output.as_ref());
                     if self.drag.dragging() {
-                        // Implicit grab keeps these flowing off-surface; move
-                        // the pet to follow. One coordinate space throughout.
-                        self.on_drag_motion(event.position);
-                        self.set_cursor(Cursor::Grabbing);
+                        if from_press {
+                            // Implicit grab keeps these flowing off-surface;
+                            // move the pet to follow. One coordinate space
+                            // throughout.
+                            self.on_drag_motion(event.position);
+                            self.set_cursor(Cursor::Grabbing);
+                        }
                     } else if self.drag.threshold_crossed(event.position) {
                         // Cross the click-vs-drag threshold: start following,
                         // and apply this first motion immediately.
@@ -119,6 +130,10 @@ impl PointerHandler for App {
                     if self.clicks.press(hit) {
                         self.drag
                             .press(event.position, (self.position.x, self.position.y));
+                        self.press_output = self
+                            .surfaces
+                            .by_surface(&event.surface)
+                            .map(|os| os.output.clone());
                     }
                 }
                 PointerEventKind::Release {
@@ -141,10 +156,11 @@ impl PointerHandler for App {
                     }
                     match self.drag.release() {
                         // Position was already applied during motion; just
-                        // settle it (clamp, relayout, persist).
+                        // settle it (clamp, relayout, persist). Takes and
+                        // parks press_output itself.
                         Release::Dropped => self.drag_drop(),
                         // Sprite click-without-drag: nothing (tray later).
-                        Release::Click | Release::None => {}
+                        Release::Click | Release::None => self.press_output = None,
                     }
                     self.set_cursor(cursor_for(false, hit));
                 }
@@ -154,6 +170,7 @@ impl PointerHandler for App {
                     debug!("right-click: hiding mascot");
                     let _ = self.ui_tx.send(UiAction::SetVisible { visible: false });
                     self.drag.release();
+                    self.press_output = None;
                     self.clicks.cancel();
                     self.hide();
                 }
