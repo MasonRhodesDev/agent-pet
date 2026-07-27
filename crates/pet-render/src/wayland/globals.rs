@@ -166,10 +166,9 @@ impl OutputHandler for App {
         &mut self,
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
-        _output: wl_output::WlOutput,
+        output: wl_output::WlOutput,
     ) {
-        // The compositor sends `closed` on the layer surface if its output
-        // goes away; recreation happens through the supervisor.
+        self.on_output_destroyed(&output);
     }
 }
 

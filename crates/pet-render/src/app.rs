@@ -947,8 +947,73 @@ impl App {
         self.ensure_surfaces();
         self.ensure_position();
         self.resolve_active();
+        self.relocate_if_offscreen();
         self.sync_layout();
         self.sync_active();
+    }
+
+    /// An output is gone: tear down its surface and, if it held the pet (or
+    /// the drag), move to the nearest remaining output. No renderer rebuild;
+    /// with zero outputs left the pet simply waits for the next `new_output`.
+    pub(crate) fn on_output_destroyed(&mut self, output: &WlOutput) {
+        let was_active = self.active_output.as_ref() == Some(output);
+        let was_press = self.press_output.as_ref() == Some(output);
+        if !self.surfaces.remove_output(output) {
+            return;
+        }
+        info!(active = was_active, "output destroyed; surface torn down");
+        if was_active {
+            self.active_output = None;
+        }
+        if was_press {
+            self.press_output = None;
+        }
+        // A drag whose grab or drawing surface died cannot continue — the
+        // compositor drops the implicit grab with the surface. Settle the
+        // pet where it stands (drag_drop re-resolves and clamps).
+        if self.drag.dragging() && (was_active || was_press) {
+            self.drag.release();
+            self.drag_drop();
+            return;
+        }
+        self.resolve_active();
+        self.relocate_if_offscreen();
+        self.sync_layout();
+        self.sync_active();
+    }
+
+    /// If the pet's centre sits on no surviving output (its monitor was
+    /// unplugged or shrank away), clamp it into the resolved active output
+    /// and persist. Never fights an in-progress drag.
+    fn relocate_if_offscreen(&mut self) {
+        if self.drag.dragging() || !self.position_initialized {
+            return;
+        }
+        let rects = self.surface_rects();
+        let (cx, cy) = (
+            self.position.x + self.surfaces.mascot_w as i32 / 2,
+            self.position.y + self.surfaces.mascot_h as i32 / 2,
+        );
+        if rects.is_empty() || outputs::output_at(&rects, cx, cy).is_some() {
+            return;
+        }
+        let Some(rect) = self.active_rect() else {
+            return;
+        };
+        let (x, y) = outputs::clamp_into(
+            &rect,
+            self.position.x,
+            self.position.y,
+            self.surfaces.mascot_w as i32,
+            self.surfaces.mascot_h as i32,
+        );
+        if (x, y) == (self.position.x, self.position.y) {
+            return;
+        }
+        self.position.x = x;
+        self.position.y = y;
+        self.position.save(&self.position_path);
+        info!(x, y, "pet relocated to the nearest remaining output");
     }
 
     /// Create a mascot surface for every output that lacks one.
@@ -973,7 +1038,7 @@ impl App {
     /// the previously active surface is blanked; drawing on the new one is
     /// the caller's next sync_layout/render.
     pub(crate) fn resolve_active(&mut self) {
-        let rects = globals::output_rects(&self.output_state);
+        let rects = self.surface_rects();
         let (cx, cy) = (
             self.position.x + self.surfaces.mascot_w as i32 / 2,
             self.position.y + self.surfaces.mascot_h as i32 / 2,
@@ -1021,6 +1086,19 @@ impl App {
         if let Err(e) = result {
             self.error = Some(e.context("present blank frame"));
         }
+    }
+
+    /// Rects of the outputs that have a live surface. This — not the raw
+    /// output list — is what placement resolves against: during
+    /// `output_destroyed` SCTK still lists the dying output, but its surface
+    /// is already gone, so it drops out here.
+    fn surface_rects(&self) -> Vec<OutputRect> {
+        self.output_state
+            .outputs()
+            .filter(|o| self.surfaces.by_output(o).is_some())
+            .filter_map(|o| self.output_state.info(&o))
+            .filter_map(|i| globals::rect_for(&i))
+            .collect()
     }
 
     /// Logical rect of a specific output, if it has reported one.
@@ -1089,10 +1167,12 @@ impl App {
     fn active_rect(&self) -> Option<OutputRect> {
         let info = match &self.active_output {
             Some(output) => self.output_state.info(output),
+            // Fallback: the first output that still has a surface (a dying
+            // output lingers in output_state until its destroy runs out).
             None => self
                 .output_state
                 .outputs()
-                .next()
+                .find(|o| self.surfaces.by_output(o).is_some())
                 .and_then(|o| self.output_state.info(&o)),
         }?;
         globals::rect_for(&info).or_else(|| {
