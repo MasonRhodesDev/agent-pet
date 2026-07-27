@@ -50,8 +50,12 @@ surfaces tile the whole desktop.
   handlers, behavior-identical on one monitor), **2a-ii** blank click-through
   inactive surfaces + drop-resolves-output (throw-to-monitor).
 - **2b** Drag hand-off: grab stays on the press surface; when the global centre
-  crosses an output boundary, switch which surface draws the pet. (Straddle
-  clipping deferred — snap when the centre crosses.)
+  crosses an output boundary, switch which surface draws the pet.
+- **2c** Straddle rendering: every output whose rect intersects the canvas's
+  global bbox draws the same frame at its own local margins (each clipped at
+  its output edge), so the pet — and its bubble — renders across the seam
+  instead of snapping at the centre crossing. A per-surface content flag
+  blanks a surface once when the pet fully leaves it.
 
 ### Phase 3 — graceful hot-swap
 - **3a** `new_output` → spin up a surface; `output_destroyed` → tear it down and,
