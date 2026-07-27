@@ -19,6 +19,13 @@ impl OutputRect {
     pub fn center(&self) -> (i32, i32) {
         (self.x + self.w / 2, self.y + self.h / 2)
     }
+
+    /// Whether a `w×h` box at `(x, y)` overlaps this rect (half-open edges:
+    /// merely touching does not count). Drives straddle rendering — while
+    /// the pet crosses a seam, every intersecting output draws its part.
+    pub fn intersects(&self, x: i32, y: i32, w: i32, h: i32) -> bool {
+        x < self.x + self.w && x + w > self.x && y < self.y + self.h && y + h > self.y
+    }
 }
 
 /// The output whose rect contains the point, if any.
@@ -78,6 +85,26 @@ mod tests {
             rect("DP-1", 0, 0, 3440, 1440),
             rect("DP-2", 3440, 0, 1920, 1080),
         ]
+    }
+
+    #[test]
+    fn intersects_finds_every_output_under_a_straddling_box() {
+        let outs = two_side_by_side();
+        let hits = |x: i32, y: i32| -> Vec<&str> {
+            outs.iter()
+                .filter(|o| o.intersects(x, y, 280, 308))
+                .map(|o| o.name.as_str())
+                .collect()
+        };
+        // Fully inside DP-1 / straddling the x=3440 seam / fully on DP-2.
+        assert_eq!(hits(1000, 500), ["DP-1"]);
+        assert_eq!(hits(3400, 500), ["DP-1", "DP-2"]);
+        assert_eq!(hits(3500, 500), ["DP-2"]);
+        // Touching the seam from the left only (right edge == 3440): DP-1 only.
+        assert_eq!(hits(3440 - 280, 500), ["DP-1"]);
+        // In the dead zone below DP-2's height: DP-1 only.
+        assert_eq!(hits(3400, 1200), ["DP-1"]);
+        assert_eq!(hits(3500, 1200), Vec::<&str>::new());
     }
 
     #[test]

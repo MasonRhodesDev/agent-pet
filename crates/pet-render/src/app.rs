@@ -538,18 +538,16 @@ impl App {
         if !self.surfaces.visibility.shown() {
             return;
         }
-        // The pet draws on the active output's surface only.
-        let Some(output) = self.active_output.clone() else {
+        let Some(active) = self.active_output.clone() else {
             return;
         };
-        let Some(oscale_raw) = self
+        if !self
             .surfaces
-            .by_output(&output)
-            .filter(|os| os.configured)
-            .map(|os| os.scale)
-        else {
+            .by_output(&active)
+            .is_some_and(|os| os.configured)
+        {
             return;
-        };
+        }
         let now = self.now_ms();
         self.timeline.advance(now);
 
@@ -563,64 +561,122 @@ impl App {
 
         let (surf_w, surf_h) = self.surfaces.surface_size();
         let (mascot_x, mascot_y) = (self.surfaces.mascot_x, self.surfaces.mascot_y);
+        // Global rect of the surface canvas. While it straddles a seam,
+        // every intersecting output's surface draws the same frame at its
+        // own local margins — each is clipped at its output's edge, so the
+        // pet renders across displays.
+        let (gx, gy) = (
+            self.position.x - mascot_x as i32,
+            self.position.y - mascot_y as i32,
+        );
 
-        let geo = Geometry {
-            surf_w,
-            surf_h,
-            mascot_x,
-            mascot_y,
-            mascot_w: self.surfaces.mascot_w,
-            bubble_above: self.surfaces.bubble_above,
-            anchor_right: self.surfaces.anchor_right,
-            sprite_scale: self.surfaces.sprite_scale,
-            oscale: oscale_raw.max(1) as u32,
-        };
-        let (buf_w, buf_h) = geo.buf_size();
-        let oscale = geo.oscale as i32;
-        let sheet = &mut self.sheet;
-        let timeline = &self.timeline;
-        let gaze = self.gaze;
-        // No bubble while dragging (repositioning, not reading); it returns
-        // on drop when the docked surface is restored.
-        let bubble = if dragging {
-            None
-        } else {
-            self.alert.visible().zip(self.text.as_mut())
-        };
-        let surface = self
-            .surfaces
-            .by_output(&output)
-            .map(|os| os.layer.wl_surface().clone())
-            .expect("active surface checked above");
-        let result = buffers::present(&mut self.pool, &surface, buf_w, buf_h, |buf| {
-            compose::scene(buf, &geo, sheet, timeline, gaze, bubble, now)
-        });
-        let bubble_px = match result {
-            Ok(px) => px,
-            Err(e) => {
-                self.error = Some(e.context("present frame"));
-                return;
-            }
-        };
-        // Only the docked bubble box tracks per-frame.
-        if dragging {
-            return;
+        struct Target {
+            output: WlOutput,
+            surface: WlSurface,
+            scale: u32,
+            margins: (i32, i32),
+            had_content: bool,
         }
-        let rect = bubble_px.map(|(x, y, w, h)| Rect {
-            x: x / oscale,
-            y: y / oscale,
-            w: w / oscale as u32,
-            h: h / oscale as u32,
-        });
-        if rect != self.surfaces.bubble_rect {
-            self.surfaces.bubble_rect = rect;
+        let mut targets: Vec<Target> = Vec::new();
+        let mut stale: Vec<WlOutput> = Vec::new();
+        for os in self.surfaces.iter() {
+            if !os.configured {
+                continue;
+            }
+            let (draws, margins) = match self.rect_of(&os.output) {
+                Some(rect) => (
+                    rect.intersects(gx, gy, surf_w as i32, surf_h as i32),
+                    (self.position.x - rect.x, self.position.y - rect.y),
+                ),
+                // No logical geometry anywhere: single-output fallback —
+                // only the active surface draws, origin-anchored.
+                None => (os.output == active, self.local_margins()),
+            };
+            if draws {
+                targets.push(Target {
+                    output: os.output.clone(),
+                    surface: os.layer.wl_surface().clone(),
+                    scale: os.scale.max(1) as u32,
+                    margins,
+                    had_content: os.content,
+                });
+            } else if os.content {
+                stale.push(os.output.clone());
+            }
+        }
+
+        let mut bubble_px_rect = self.surfaces.bubble_rect;
+        for t in &targets {
+            let geo = Geometry {
+                surf_w,
+                surf_h,
+                mascot_x,
+                mascot_y,
+                mascot_w: self.surfaces.mascot_w,
+                bubble_above: self.surfaces.bubble_above,
+                anchor_right: self.surfaces.anchor_right,
+                sprite_scale: self.surfaces.sprite_scale,
+                oscale: t.scale,
+            };
+            let (buf_w, buf_h) = geo.buf_size();
+            let oscale = geo.oscale as i32;
+            let sheet = &mut self.sheet;
+            let timeline = &self.timeline;
+            let gaze = self.gaze;
+            // No bubble while dragging (repositioning, not reading); it
+            // returns on drop when the docked surface is restored.
+            let bubble = if dragging {
+                None
+            } else {
+                self.alert.visible().zip(self.text.as_mut())
+            };
+            // Margins ride the present's commit.
+            self.surfaces.apply_margins(&t.output, t.margins);
+            let result = buffers::present(&mut self.pool, &t.surface, buf_w, buf_h, |buf| {
+                compose::scene(buf, &geo, sheet, timeline, gaze, bubble, now)
+            });
+            match result {
+                Ok(px) => {
+                    if t.output == active {
+                        bubble_px_rect = px.map(|(x, y, w, h)| Rect {
+                            x: x / oscale,
+                            y: y / oscale,
+                            w: w / oscale as u32,
+                            h: h / oscale as u32,
+                        });
+                    }
+                }
+                Err(e) => {
+                    self.error = Some(e.context("present frame"));
+                    return;
+                }
+            }
+            self.surfaces.mark_content(&t.output, true);
+        }
+        // The pet left these outputs since the last frame.
+        for output in stale {
+            self.blank_surface(&output);
+        }
+
+        // Input regions: every drawing surface carries the same surface-local
+        // region (the shared canvas layout is identical), so the pet is
+        // clickable on both sides of a seam. The bubble box only tracks while
+        // docked; mid-drag only newly drawing surfaces get a region.
+        let bubble_changed = !dragging && bubble_px_rect != self.surfaces.bubble_rect;
+        if bubble_changed {
+            self.surfaces.bubble_rect = bubble_px_rect;
+        }
+        for t in &targets {
+            if !(bubble_changed || !t.had_content) {
+                continue;
+            }
             if let Err(e) = self
                 .surfaces
-                .update_input_region(&output, &self.compositor_state)
+                .update_input_region(&t.output, &self.compositor_state)
             {
                 warn!("input region update failed: {e:#}");
             }
-            self.surfaces.commit(&output);
+            self.surfaces.commit(&t.output);
         }
     }
 
@@ -803,37 +859,28 @@ impl App {
         };
         self.position.x = x;
         self.position.y = y;
-        // Seam hand-off: when the centre crosses into another output, switch
-        // the drawing surface (resolve blanks the old one) and give the new
-        // one the pet's input region so the post-release hover state is
-        // already right.
-        let before = self.active_output.clone();
+        // Keep the active output tracking the centre (clamp target, timers);
+        // drawing and blanking across the seam is the render pass's job —
+        // every straddled output gets the frame at its own margins (no
+        // relayout: quadrant frozen for the drag).
         self.resolve_active();
-        let crossed = before != self.active_output;
-        if let Some(active) = self.active_output.clone() {
-            // No relayout: quadrant frozen for the drag.
-            self.surfaces.apply_margins(&active, self.local_margins());
-            if crossed {
-                if let Err(e) = self
-                    .surfaces
-                    .update_input_region(&active, &self.compositor_state)
-                {
-                    warn!("input region update failed: {e:#}");
-                }
-            }
-        }
         // The press surface must keep sliding 1:1 with the pet regardless of
         // who draws it — drag.rs's incremental math reads pointer coords
-        // relative to it (a commit with no buffer applies margins alone).
-        if let Some(press) = self
-            .press_output
-            .clone()
-            .filter(|p| Some(p) != self.active_output.as_ref())
-        {
+        // relative to it. When the pet no longer straddles the press output,
+        // the render pass won't touch it, so mirror the margins by hand (a
+        // commit with no buffer applies margins alone).
+        if let Some(press) = self.press_output.clone() {
             if let Some(rect) = self.rect_of(&press) {
-                self.surfaces
-                    .apply_margins(&press, (x - rect.x, y - rect.y));
-                self.surfaces.commit(&press);
+                let (surf_w, surf_h) = self.surfaces.surface_size();
+                let (gx, gy) = (
+                    x - self.surfaces.mascot_x as i32,
+                    y - self.surfaces.mascot_y as i32,
+                );
+                if !rect.intersects(gx, gy, surf_w as i32, surf_h as i32) {
+                    self.surfaces
+                        .apply_margins(&press, (x - rect.x, y - rect.y));
+                    self.surfaces.commit(&press);
+                }
             }
         }
         let now = self.now_ms();
@@ -1050,15 +1097,12 @@ impl App {
             self.position.x + self.surfaces.mascot_w as i32 / 2,
             self.position.y + self.surfaces.mascot_h as i32 / 2,
         );
-        let old = self.active_output.clone();
         self.active_output = match outputs::resolve(&rects, cx, cy) {
             Some((rect, _, _)) => self.output_for_rect(rect),
             None => self.surfaces.first_output(),
         };
-        if let Some(old) = old.filter(|o| Some(o) != self.active_output.as_ref()) {
-            debug!("active output changed; blanking the previous surface");
-            self.blank_surface(&old);
-        }
+        // No blanking here: the render pass draws every straddled output and
+        // blanks the ones the pet has fully left.
     }
 
     /// Commit a fully transparent frame + empty input region on `output`'s
@@ -1093,6 +1137,7 @@ impl App {
         if let Err(e) = result {
             self.error = Some(e.context("present blank frame"));
         }
+        self.surfaces.mark_content(output, false);
     }
 
     /// Rects of the outputs that have a live surface. This — not the raw

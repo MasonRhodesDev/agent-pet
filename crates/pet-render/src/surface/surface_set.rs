@@ -39,6 +39,10 @@ pub struct OutputSurface {
     pub configured: bool,
     /// wl_output integer buffer scale for this surface's output.
     pub scale: i32,
+    /// A pet frame is currently attached (as opposed to blank/unmapped).
+    /// Lets the render pass blank a surface exactly once when the pet
+    /// leaves its output.
+    pub content: bool,
     input_region: Option<Region>,
 }
 
@@ -124,6 +128,7 @@ impl SurfaceSet {
             layer,
             configured: false,
             scale: 1,
+            content: false,
             input_region: None,
         };
         // Surfaces start inactive: fully click-through. The active surface
@@ -159,6 +164,16 @@ impl SurfaceSet {
 
     pub fn first_output(&self) -> Option<WlOutput> {
         self.surfaces.first().map(|os| os.output.clone())
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &OutputSurface> {
+        self.surfaces.iter()
+    }
+
+    pub fn mark_content(&mut self, output: &WlOutput, content: bool) {
+        if let Some(os) = self.surfaces.iter_mut().find(|os| os.output == *output) {
+            os.content = content;
+        }
     }
 
     /// Current logical surface size (always the docked size — the pet moves
@@ -244,6 +259,7 @@ impl SurfaceSet {
             os.layer.attach(None, 0, 0);
             os.layer.commit();
             os.configured = false;
+            os.content = false;
         }
         self.visibility = Visibility::Hidden;
     }
@@ -340,7 +356,6 @@ impl LayerShellHandler for App {
         };
         let first = !os.configured;
         os.configured = true;
-        let output = os.output.clone();
         if first {
             info!(
                 sprite_w = self.surfaces.mascot_w,
@@ -353,12 +368,9 @@ impl LayerShellHandler for App {
         }
         self.ensure_position();
         self.resolve_active();
-        if self.active_output.as_ref() != Some(&output) {
-            // An inactive surface: keep it mapped but invisible so the 2b
-            // seam hand-off never waits on a configure round-trip.
-            self.blank_surface(&output);
-        }
         self.sync_layout();
+        // The render pass draws every surface the pet straddles and blanks
+        // the rest; a fresh surface simply stays buffer-less until then.
         self.sync_active();
     }
 }
