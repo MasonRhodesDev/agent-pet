@@ -126,7 +126,9 @@ impl SurfaceSet {
             scale: 1,
             input_region: None,
         };
-        set_input_region(&mut os, compositor, self.sprite_rect(), self.bubble_rect)?;
+        // Surfaces start inactive: fully click-through. The active surface
+        // gets its real input region via sync_layout.
+        set_input_region(&mut os, compositor, &[])?;
         self.surfaces.push(os);
         Ok(())
     }
@@ -216,11 +218,23 @@ impl SurfaceSet {
         output: &WlOutput,
         compositor: &CompositorState,
     ) -> Result<()> {
-        let (sprite, bubble) = (self.sprite_rect(), self.bubble_rect);
+        let rects = router::input_rects(self.sprite_rect(), self.bubble_rect);
         let Some(os) = self.surfaces.iter_mut().find(|os| os.output == *output) else {
             return Ok(());
         };
-        set_input_region(os, compositor, sprite, bubble)
+        set_input_region(os, compositor, &rects)
+    }
+
+    /// Make `output`'s surface fully click-through (an inactive surface).
+    pub fn clear_input_region(
+        &mut self,
+        output: &WlOutput,
+        compositor: &CompositorState,
+    ) -> Result<()> {
+        let Some(os) = self.surfaces.iter_mut().find(|os| os.output == *output) else {
+            return Ok(());
+        };
+        set_input_region(os, compositor, &[])
     }
 
     /// Unmap every surface by committing null buffers. Remapping requires a
@@ -263,11 +277,11 @@ impl SurfaceSet {
 fn set_input_region(
     os: &mut OutputSurface,
     compositor: &CompositorState,
-    sprite: Rect,
-    bubble: Option<Rect>,
+    rects: &[Rect],
 ) -> Result<()> {
+    // An empty region (no rects added) means fully click-through.
     let region = Region::new(compositor).context("create input region")?;
-    for rect in router::input_rects(sprite, bubble) {
+    for rect in rects {
         region.add(rect.x, rect.y, rect.w as i32, rect.h as i32);
     }
     os.layer.set_input_region(Some(region.wl_region()));
@@ -297,6 +311,7 @@ impl LayerShellHandler for App {
         };
         let first = !os.configured;
         os.configured = true;
+        let output = os.output.clone();
         if first {
             info!(
                 sprite_w = self.surfaces.mascot_w,
@@ -309,6 +324,11 @@ impl LayerShellHandler for App {
         }
         self.ensure_position();
         self.resolve_active();
+        if self.active_output.as_ref() != Some(&output) {
+            // An inactive surface: keep it mapped but invisible so the 2b
+            // seam hand-off never waits on a configure round-trip.
+            self.blank_surface(&output);
+        }
         self.sync_layout();
         self.sync_active();
     }

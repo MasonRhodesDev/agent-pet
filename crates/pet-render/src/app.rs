@@ -814,6 +814,10 @@ impl App {
     /// Drag finished: clamp on-screen, re-pick the layout quadrant for the
     /// resting position, persist.
     pub(crate) fn drag_drop(&mut self) {
+        // The drop may land on another output (throw-to-monitor): re-resolve
+        // first so the clamp targets the output actually under the pet, then
+        // draw there (the old surface was blanked by the resolve).
+        self.resolve_active();
         if let Some(rect) = self.active_rect() {
             let (x, y) = outputs::clamp_into(
                 &rect,
@@ -920,17 +924,58 @@ impl App {
 
     /// Recompute which output's surface should draw the pet: the one whose
     /// rect contains the pet's centre, else the nearest. Falls back to the
-    /// first surface when no output reports logical geometry.
+    /// first surface when no output reports logical geometry. On a change
+    /// the previously active surface is blanked; drawing on the new one is
+    /// the caller's next sync_layout/render.
     pub(crate) fn resolve_active(&mut self) {
         let rects = globals::output_rects(&self.output_state);
         let (cx, cy) = (
             self.position.x + self.surfaces.mascot_w as i32 / 2,
             self.position.y + self.surfaces.mascot_h as i32 / 2,
         );
+        let old = self.active_output.clone();
         self.active_output = match outputs::resolve(&rects, cx, cy) {
             Some((rect, _, _)) => self.output_for_rect(rect),
             None => self.surfaces.first_output(),
         };
+        if let Some(old) = old.filter(|o| Some(o) != self.active_output.as_ref()) {
+            debug!("active output changed; blanking the previous surface");
+            self.blank_surface(&old);
+        }
+    }
+
+    /// Commit a fully transparent frame + empty input region on `output`'s
+    /// surface: it stays mapped (no configure round-trip to come back) but is
+    /// invisible and click-through. No-op while hidden or unconfigured.
+    pub(crate) fn blank_surface(&mut self, output: &WlOutput) {
+        if self.surfaces.visibility == Visibility::Hidden {
+            return; // hidden surfaces are unmapped, not blank
+        }
+        let Some((surface, scale)) = self
+            .surfaces
+            .by_output(output)
+            .filter(|os| os.configured)
+            .map(|os| (os.layer.wl_surface().clone(), os.scale.max(1) as u32))
+        else {
+            return;
+        };
+        if let Err(e) = self
+            .surfaces
+            .clear_input_region(output, &self.compositor_state)
+        {
+            warn!("clear input region failed: {e:#}");
+        }
+        let (surf_w, surf_h) = self.surfaces.surface_size();
+        let result = buffers::present(
+            &mut self.pool,
+            &surface,
+            surf_w * scale,
+            surf_h * scale,
+            |buf| buf.fill(0),
+        );
+        if let Err(e) = result {
+            self.error = Some(e.context("present blank frame"));
+        }
     }
 
     fn output_for_rect(&self, rect: &OutputRect) -> Option<WlOutput> {
