@@ -18,6 +18,10 @@ pub const TRI_W: u32 = 14;
 pub const BOX_GAP: u32 = 8;
 pub const MAX_BODY_LINES: usize = 3;
 pub const MS_PER_CHAR: u64 = 30;
+/// Redraw grid for the reveal: characters appear in small bursts instead of
+/// one frame per character, so a typing bubble can't pin the render loop at
+/// 1000/MS_PER_CHAR fps (expensive when the surface straddles a GPU seam).
+pub const TYPE_TICK_MS: u64 = 90;
 
 const BG: Rgba = Rgba(24, 26, 32, 0.85);
 const LABEL_COLOR: Rgba = Rgba(255, 214, 130, 1.0);
@@ -64,13 +68,15 @@ impl Bubble {
             .unwrap_or(self.body.len())
     }
 
-    /// When the next character appears; None once fully revealed.
+    /// When the next reveal redraw lands; None once fully revealed. Reveal
+    /// pace is still MS_PER_CHAR, but deadlines land on the TYPE_TICK_MS
+    /// grid, so each frame shows the few characters that became due.
     pub fn typing_deadline_ms(&self, now_ms: u64) -> Option<u64> {
-        let visible = self.visible_chars(now_ms);
-        if visible >= self.chars_total {
+        if self.visible_chars(now_ms) >= self.chars_total {
             return None;
         }
-        Some(self.started_ms + (visible as u64 + 1) * MS_PER_CHAR)
+        let elapsed = now_ms.saturating_sub(self.started_ms);
+        Some(self.started_ms + (elapsed / TYPE_TICK_MS + 1) * TYPE_TICK_MS)
     }
 }
 
@@ -372,13 +378,13 @@ mod tests {
             "ab".into(),
             0,
         );
-        assert_eq!(b.typing_deadline_ms(0), Some(30));
-        assert_eq!(b.typing_deadline_ms(30), Some(60));
-        assert_eq!(b.typing_deadline_ms(59), Some(60));
+        assert_eq!(b.typing_deadline_ms(0), Some(90));
+        assert_eq!(b.typing_deadline_ms(30), Some(90));
+        assert_eq!(b.typing_deadline_ms(59), Some(90));
         assert_eq!(b.typing_deadline_ms(60), None);
         // Time never runs backwards past the start.
         let late = Bubble::new(SessionKey::new(Source::Claude, "s"), "x", "ab".into(), 100);
-        assert_eq!(late.typing_deadline_ms(0), Some(130));
+        assert_eq!(late.typing_deadline_ms(0), Some(190));
     }
 
     #[test]

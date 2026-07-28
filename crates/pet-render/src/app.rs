@@ -696,7 +696,9 @@ impl App {
             deadline = deadline.min(t);
         }
         let at = self.started + Duration::from_millis(deadline);
-        at.max(Instant::now() + Duration::from_millis(1))
+        // Floor of ~30fps: overdue deadlines must not busy-spin the render
+        // loop — each frame here redraws every surface the pet touches.
+        at.max(Instant::now() + Duration::from_millis(33))
     }
 
     /// Start the frame timer if it is not running (post-show / startup).
