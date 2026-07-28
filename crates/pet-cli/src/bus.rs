@@ -5,7 +5,10 @@ use std::time::Duration;
 use anyhow::Context;
 use pet_proto::{Event, BUS_NAME, INTERFACE, OBJECT_PATH};
 
-/// Send one event, relying on bus activation to start the daemon if needed.
+/// Send one event to an already-running daemon; never auto-start it.
+/// Emits fire from agent hooks that may run before the graphical session
+/// exists — activation there just enqueues doomed start jobs (the unit is
+/// Requisite=graphical-session.target). The session starts the daemon.
 /// The caller (emit path) treats any error as non-fatal.
 pub async fn send_event(event: &Event) -> anyhow::Result<()> {
     let json = serde_json::to_string(event)?;
@@ -16,6 +19,7 @@ pub async fn send_event(event: &Event) -> anyhow::Result<()> {
             .destination(BUS_NAME)?
             .interface(INTERFACE)?
             .with_flags(zbus::message::Flags::NoReplyExpected)?
+            .with_flags(zbus::message::Flags::NoAutoStart)?
             .build(&(json.as_str(),))?;
         conn.send(&msg).await?;
         Ok::<_, anyhow::Error>(())
